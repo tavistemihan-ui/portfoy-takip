@@ -30,16 +30,6 @@ if not check_password():
     st.stop()  # Şifre doğru girilene kadar uygulamanın geri kalanını çalıştırmaz
 # ----------------------------
 
-import streamlit as st
-import pandas as pd
-import plotly.express as px
-from datetime import datetime
-import io
-import requests
-import sqlite3
-import json
-import yfinance as yf
-
 st.set_page_config(
     page_title="Portföy Terminal Pro",
     page_icon="💼",
@@ -124,7 +114,7 @@ def check_password():
 if not check_password():
     st.stop()
 
-# --- 3. CANLI DÖVİZ KURLARI & CANLI HİSSE FİYATLARI ---
+# --- 3. DÖVİZ KURLARI & HİSSE BİLGİLERİ (FİYAT VE SEKTÖR) ---
 @st.cache_data(ttl=1800)
 def fetch_live_fx_rates():
     rates = {"USD_TRY": 34.20, "EUR_TRY": 37.80, "EUR_USD": 1.10}
@@ -144,17 +134,33 @@ def fetch_live_fx_rates():
 live_rates = fetch_live_fx_rates()
 
 @st.cache_data(ttl=300)
-def get_live_stock_price(ticker: str) -> float:
-    """Yahoo Finance üzerinden güncel fiyatı çeker."""
+def get_live_stock_data(ticker: str):
+    """Yahoo Finance üzerinden güncel fiyat ve sektör bilgisini çeker."""
     try:
         t = yf.Ticker(ticker.strip().upper())
         hist = t.history(period="1d")
+        price = 0.0
         if not hist.empty:
-            return round(float(hist["Close"].iloc[-1]), 2)
-        info = t.info
-        return round(float(info.get("regularMarketPrice") or info.get("previousClose") or 0.0), 2)
+            price = round(float(hist["Close"].iloc[-1]), 2)
+        else:
+            info = t.info
+            price = round(float(info.get("regularMarketPrice") or info.get("previousClose") or 0.0), 2)
+        
+        # Sektör bilgisi
+        sector = t.info.get("sector", "Diğer")
+        return price, sector
     except Exception:
-        return 0.0
+        return 0.0, "Diğer"
+
+def format_curr(amount: float, curr: str) -> str:
+    """USD için $ sola, EUR için € sola, TRY için ₺ sola formatlar."""
+    if curr == "USD":
+        return f"${amount:,.2f}"
+    elif curr == "EUR":
+        return f"€{amount:,.2f}"
+    elif curr == "TRY":
+        return f"₺{amount:,.2f}"
+    return f"{amount:,.2f} {curr}"
 
 def convert_to_base(amount: float, from_curr: str, to_curr: str) -> float:
     if from_curr == to_curr:
@@ -233,7 +239,7 @@ with st.sidebar:
         ]
     )
 
-# --- 6. DASHBOARD (CANLI FİYAT VE ANLIK K/Z ENTEGRELİ) ---
+# --- 6. DASHBOARD (SEKTÖREL VE VARLIK DAĞILIMLI, RENKLİ K/Z) ---
 if menu == "📊 Dashboard (Canlı Fiyatlı)":
     lots_df = load_open_lots()
     sales_df = load_sales()
@@ -241,7 +247,6 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
     if is_consolidated:
         st.title(f"🌐 Konsolide Portföy ({base_currency})")
         
-        # Konsolide hesaplama ve canlı fiyat takviyesi
         total_cost_base = 0.0
         total_current_val_base = 0.0
         total_realized_base = 0.0
@@ -255,10 +260,9 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
             p_cost_b = convert_to_base(p_cost, p["currency"], base_currency)
             total_cost_base += p_cost_b
 
-            # Portföydeki açık hisselerin güncel değeri
             p_cur_val = 0.0
             for _, lot in p_lots.iterrows():
-                lp = get_live_stock_price(lot["ticker"])
+                lp, _ = get_live_stock_data(lot["ticker"])
                 cur_p = lp if lp > 0 else lot["buy_price"]
                 p_cur_val += lot["remaining_shares"] * cur_p
             
@@ -270,33 +274,33 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
 
             portfolio_rows.append({
                 "Portföy": p["name"],
-                f"Toplam Maliyet ({base_currency})": p_cost_b,
-                f"Güncel Piyasa Değeri ({base_currency})": p_cur_val_b,
-                "Anlık K/Z": p_cur_val_b - p_cost_b
+                "Toplam Maliyet": format_curr(p_cost_b, base_currency),
+                "Güncel Piyasa Değeri": format_curr(p_cur_val_b, base_currency),
+                "Piyasa Değeri Ham": p_cur_val_b
             })
 
         unrealized_total_base = total_current_val_base - total_cost_base
         unrealized_pct = (unrealized_total_base / total_cost_base * 100) if total_cost_base > 0 else 0
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric(f"Güncel Piyasa Değeri", f"{total_current_val_base:,.2f} {base_currency}")
-        c2.metric(f"Toplam Alış Maliyeti", f"{total_cost_base:,.2f} {base_currency}")
-        c3.metric("Anlık Kâr/Zarar", f"{unrealized_total_base:+,.2f} {base_currency}", delta=f"%{unrealized_pct:+.2f}")
-        c4.metric("Realize Edilmiş K/Z", f"{total_realized_base:+,.2f} {base_currency}")
+        c1.metric("Güncel Piyasa Değeri", format_curr(total_current_val_base, base_currency))
+        c2.metric("Toplam Alış Maliyeti", format_curr(total_cost_base, base_currency))
+        c3.metric("Anlık Kâr/Zarar", format_curr(unrealized_total_base, base_currency), delta=f"%{unrealized_pct:+.2f}")
+        c4.metric("Realize Edilmiş K/Z", format_curr(total_realized_base, base_currency))
 
         st.divider()
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("Portföy Büyüklük Dağılımı")
             if total_current_val_base > 0:
-                fig = px.pie(pd.DataFrame(portfolio_rows), names="Portföy", values=f"Güncel Piyasa Değeri ({base_currency})", hole=0.4, template="plotly_dark")
+                fig = px.pie(pd.DataFrame(portfolio_rows), names="Portföy", values="Piyasa Değeri Ham", hole=0.4, template="plotly_dark")
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("Portföyde açık hisse yok.")
         with col2:
             st.subheader("Konsolide Portföy Dağılım Tablosu")
-            df_display_summary = pd.DataFrame(portfolio_rows)
-            st.dataframe(df_display_summary, hide_index=True, use_container_width=True)
+            df_disp = pd.DataFrame(portfolio_rows).drop(columns=["Piyasa Değeri Ham"])
+            st.dataframe(df_disp, hide_index=True, use_container_width=True)
 
     else:
         p_info = portfolios_df[portfolios_df["id"] == current_p_id].iloc[0]
@@ -308,12 +312,11 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
         total_cost = (p_lots["remaining_shares"] * p_lots["buy_price"]).sum() if not p_lots.empty else 0.0
         realized_pnl = p_sales["realized_pnl"].sum() if not p_sales.empty else 0.0
 
-        # Her açık lot için canlı fiyatı ve kâr/zararı hesapla
         lot_details = []
         total_market_val = 0.0
 
         for _, lot in p_lots.iterrows():
-            live_p = get_live_stock_price(lot["ticker"])
+            live_p, sector = get_live_stock_data(lot["ticker"])
             effective_price = live_p if live_p > 0 else lot["buy_price"]
             market_val = lot["remaining_shares"] * effective_price
             cost_val = lot["remaining_shares"] * lot["buy_price"]
@@ -323,29 +326,59 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
 
             lot_details.append({
                 "Hisse": lot["ticker"],
+                "Sektör": sector,
                 "Alış Tarihi": lot["buy_date"],
                 "Kalan Lot": lot["remaining_shares"],
-                f"Alış Fiyatı ({p_info['currency']})": f"{lot['buy_price']:,.2f}",
-                f"Şimdiki Fiyat ({p_info['currency']})": f"{effective_price:,.2f}",
-                f"Toplam Maliyet ({p_info['currency']})": f"{cost_val:,.2f}",
-                f"Piyasa Değeri ({p_info['currency']})": f"{market_val:,.2f}",
-                f"Anlık K/Z Tutarı ({p_info['currency']})": f"{pnl_val:+,.2f}",
-                "Anlık K/Z (%)": f"%{pnl_pct:+.2f}"
+                "Alış Fiyatı": format_curr(lot['buy_price'], p_info['currency']),
+                "Şimdiki Fiyat": format_curr(effective_price, p_info['currency']),
+                "Toplam Maliyet": format_curr(cost_val, p_info['currency']),
+                "Piyasa Değeri": format_curr(market_val, p_info['currency']),
+                "Piyasa Değeri Ham": market_val,
+                "Anlık K/Z Tutarı": format_curr(pnl_val, p_info['currency']),
+                "Anlık K/Z (%)": pnl_pct
             })
 
         total_unrealized_pnl = total_market_val - total_cost
         total_unrealized_pct = (total_unrealized_pnl / total_cost * 100) if total_cost > 0 else 0.0
 
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Güncel Portföy Değeri", f"{total_market_val:,.2f} {p_info['currency']}")
-        c2.metric("Toplam Alış Maliyeti", f"{total_cost:,.2f} {p_info['currency']}")
-        c3.metric("Anlık Kâr/Zarar", f"{total_unrealized_pnl:+,.2f} {p_info['currency']}", delta=f"%{total_unrealized_pct:+.2f}")
-        c4.metric("Realize Edilmiş K/Z", f"{realized_pnl:+,.2f} {p_info['currency']}")
+        c1.metric("Güncel Portföy Değeri", format_curr(total_market_val, p_info['currency']))
+        c2.metric("Toplam Alış Maliyeti", format_curr(total_cost, p_info['currency']))
+        c3.metric("Anlık Kâr/Zarar", format_curr(total_unrealized_pnl, p_info['currency']), delta=f"%{total_unrealized_pct:+.2f}")
+        c4.metric("Realize Edilmiş K/Z", format_curr(realized_pnl, p_info['currency']))
 
         st.divider()
-        st.subheader("📌 Açık Pozisyonlar ve Canlı K/Z Durumu")
+
+        # PASTA GRAFİKLERİ BÖLÜMÜ: VARLIK DAĞILIMI VE SEKTÖREL DAĞILIM
         if lot_details:
-            st.dataframe(pd.DataFrame(lot_details), hide_index=True, use_container_width=True)
+            df_lots_full = pd.DataFrame(lot_details)
+            g1, g2 = st.columns(2)
+            with g1:
+                st.subheader("🥧 Portföy Varlık Dağılımı (%)")
+                asset_agg = df_lots_full.groupby("Hisse")["Piyasa Değeri Ham"].sum().reset_index()
+                fig_asset = px.pie(asset_agg, names="Hisse", values="Piyasa Değeri Ham", hole=0.4, template="plotly_dark")
+                st.plotly_chart(fig_asset, use_container_width=True)
+
+            with g2:
+                st.subheader("🏭 Sektörel Portföy Dağılımı (%)")
+                sector_agg = df_lots_full.groupby("Sektör")["Piyasa Değeri Ham"].sum().reset_index()
+                fig_sector = px.pie(sector_agg, names="Sektör", values="Piyasa Değeri Ham", hole=0.4, template="plotly_dark")
+                st.plotly_chart(fig_sector, use_container_width=True)
+
+            st.divider()
+            st.subheader("📌 Açık Pozisyonlar ve Canlı K/Z Durumu")
+
+            # Yüzdeleri pozitifse yeşil, negatifse kırmızı renklendirme
+            def style_returns(val):
+                color = '#2ea043' if val >= 0 else '#f85149'
+                return f'color: {color}; font-weight: bold;'
+
+            df_table = df_lots_full.drop(columns=["Piyasa Değeri Ham"])
+            
+            styled_df = df_table.style.map(style_returns, subset=["Anlık K/Z (%)"]).format({
+                "Anlık K/Z (%)": lambda v: f"%{v:+.2f}"
+            })
+            st.dataframe(styled_df, hide_index=True, use_container_width=True)
         else:
             st.info("Bu portföyde henüz açık hisse bulunmuyor.")
 
@@ -413,7 +446,7 @@ elif menu == "📝 Yeni İşlem / Satış":
             for _, lot in ticker_lots.iterrows():
                 c1, c2, c3, c4 = st.columns([2, 2, 2, 3])
                 c1.write(f"📅 **{lot['buy_date']}**")
-                c2.write(f"Alış: **{lot['buy_price']} {lot['currency']}**")
+                c2.write(f"Alış: **{format_curr(lot['buy_price'], lot['currency'])}**")
                 c3.write(f"Kalan: **{lot['remaining_shares']} lot**")
                 qty = c4.number_input(
                     f"Sat (Lot #{lot['lot_id']})",
@@ -436,9 +469,9 @@ elif menu == "📝 Yeni İşlem / Satış":
                 st.divider()
                 m1, m2, m3, m4 = st.columns(4)
                 m1.metric("Satılacak Lot", f"{total_sold:.0f}")
-                m2.metric("Alış Maliyeti", f"{total_cost:,.2f} {target_pcurr}")
-                m3.metric("Satış Geliri", f"{proceeds:,.2f} {target_pcurr}")
-                m4.metric("Net Kâr/Zarar", f"{realized_pnl:+,.2f} {target_pcurr}", delta=f"%{ret_pct:+.2f}")
+                m2.metric("Alış Maliyeti", format_curr(total_cost, target_pcurr))
+                m3.metric("Satış Geliri", format_curr(proceeds, target_pcurr))
+                m4.metric("Net Kâr/Zarar", format_curr(realized_pnl, target_pcurr), delta=f"%{ret_pct:+.2f}")
 
                 if st.button("Satışı Onayla ve Tamamla", type="primary"):
                     with get_connection() as conn:
@@ -454,10 +487,10 @@ elif menu == "📝 Yeni İşlem / Satış":
                     st.success("Satış tamamlandı!")
                     st.rerun()
 
-# --- 8. SATIŞ SONRASI PERFORMANS (ALIŞ FİYATI & KARAR ANALİZİ ENTEGRELİ) ---
+# --- 8. SATIŞ SONRASI PERFORMANS (CANLI) ---
 elif menu == "🎯 Satış Sonrası Performans (Canlı)":
     st.title("🎯 Satış Sonrası Canlı Fiyat & Karar Analizi")
-    st.caption("Alış fiyatı, satış fiyatı ve güncel piyasa fiyatı arasındaki tüm farklar canlı olarak karşılaştırılır.")
+    st.caption("Alış, satış ve güncel piyasa fiyatı arasındaki tüm farklar canlı karşılaştırılır.")
 
     sales_df = load_sales()
     if sales_df.empty:
@@ -471,28 +504,21 @@ elif menu == "🎯 Satış Sonrası Performans (Canlı)":
             with st.container():
                 st.markdown(f"### 📌 {sale['ticker']} Satışı (#{sale['sale_id']}) - {sale['sale_date']}")
                 
-                # Orijinal alış fiyatı (ağırlıklı ortalama birim maliyet)
                 avg_buy_price = (sale["cost"] / sale["shares"]) if sale["shares"] > 0 else 0.0
-                
-                # Fiyatı internetten çek
-                live_price = get_live_stock_price(sale['ticker'])
+                live_price, _ = get_live_stock_data(sale['ticker'])
                 current_p = live_price if live_price > 0 else (sale['current_price'] or sale['sale_price'])
 
-                # Üst Metrikler: Alış, Satış ve Şimdiki Fiyat
                 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
                 col_m1.metric("Satılan Adet", f"{sale['shares']} Lot")
-                col_m1.caption(f"Realize Net K/Z: **{sale['realized_pnl']:+,.2f} {sale['currency']}**")
-                col_m2.metric(f"Orijinal Alış Fiyatı", f"{avg_buy_price:,.2f} {sale['currency']}")
-                col_m3.metric(f"Satış Fiyatı", f"{sale['sale_price']:,.2f} {sale['currency']}")
-                col_m4.metric(f"Şu Anki Canlı Fiyat", f"{current_p:,.2f} {sale['currency']}")
+                col_m1.caption(f"Realize Net K/Z: **{format_curr(sale['realized_pnl'], sale['currency'])}**")
+                col_m2.metric("Orijinal Alış Fiyatı", format_curr(avg_buy_price, sale['currency']))
+                col_m3.metric("Satış Fiyatı", format_curr(sale['sale_price'], sale['currency']))
+                col_m4.metric("Şu Anki Canlı Fiyat", format_curr(current_p, sale['currency']))
 
-                st.write("")
-                # Karşılaştırma 1: Satıştan Sonraki Değişim (Erken mi sattım?)
                 diff_sale = current_p - sale["sale_price"]
                 diff_sale_pct = (diff_sale / sale["sale_price"] * 100) if sale["sale_price"] > 0 else 0.0
                 potential_diff_total = diff_sale * sale["shares"]
 
-                # Karşılaştırma 2: Alıştan Sonraki Toplam Değişim (Satmasaydım bugüne göre toplam getiri ne olurdu?)
                 diff_buy = current_p - avg_buy_price
                 diff_buy_pct = (diff_buy / avg_buy_price * 100) if avg_buy_price > 0 else 0.0
                 total_gain_if_held = diff_buy * sale["shares"]
@@ -500,36 +526,28 @@ elif menu == "🎯 Satış Sonrası Performans (Canlı)":
                 sub1, sub2, sub3 = st.columns(3)
                 with sub1:
                     st.markdown("**1. Satışa Göre Karşılaştırma**")
-                    if diff_sale > 0:
-                        st.metric("Satıştan Sonraki Fark", f"+%{diff_sale_pct:.2f}", f"+{diff_sale:,.2f} {sale['currency']}")
-                        st.caption(f"Kaçırılan Potansiyel Kâr: **+{potential_diff_total:,.2f} {sale['currency']}**")
-                    elif diff_sale < 0:
-                        st.metric("Satıştan Sonraki Fark", f"%{diff_sale_pct:.2f}", f"{diff_sale:,.2f} {sale['currency']}")
-                        st.caption(f"Kurtarılan Sermaye Kaybı: **{abs(potential_diff_total):,.2f} {sale['currency']}**")
-                    else:
-                        st.metric("Satıştan Sonraki Fark", "%0.00", f"0.00 {sale['currency']}")
+                    color_sale = "#2ea043" if diff_sale >= 0 else "#f85149"
+                    st.markdown(f"Fark: <span style='color:{color_sale}; font-weight:bold;'>%{diff_sale_pct:+.2f} ({format_curr(diff_sale, sale['currency'])})</span>", unsafe_allow_html=True)
+                    st.caption(f"Potansiyel Fark Tutarı: **{format_curr(potential_diff_total, sale['currency'])}**")
 
                 with sub2:
-                    st.markdown("**2. Alışa Göre Toplam Fark (Şimdiki Fiyat)**")
-                    st.metric(
-                        "Alıştan Bugüne Fark",
-                        f"%{diff_buy_pct:+.2f}",
-                        f"{diff_buy:+,.2f} {sale['currency']}"
-                    )
-                    st.caption(f"Elde Tutulsaydı Toplam K/Z: **{total_gain_if_held:+,.2f} {sale['currency']}**")
+                    st.markdown("**2. Alışa Göre Toplam Fark (Bugün)**")
+                    color_buy = "#2ea043" if diff_buy >= 0 else "#f85149"
+                    st.markdown(f"Fark: <span style='color:{color_buy}; font-weight:bold;'>%{diff_buy_pct:+.2f} ({format_curr(diff_buy, sale['currency'])})</span>", unsafe_allow_html=True)
+                    st.caption(f"Satılmasaydı Toplam K/Z: **{format_curr(total_gain_if_held, sale['currency'])}**")
 
                 with sub3:
                     st.markdown("**3. Karar Yorumu**")
                     if diff_sale > 0:
-                        st.warning("⚠️ Satış sonrası yükseliş devam etti (Erken Satış).")
+                        st.warning("⚠️ Satış sonrası yükseliş devam etti (Erken Çıkış).")
                     elif diff_sale < 0:
                         st.success("✅ Fiyat satış seviyesinin altına indi (Doğru Çıkış).")
                     else:
-                        st.info("ℹ️ Fiyat halen satış seviyesinde seyrediyor.")
+                        st.info("ℹ️ Fiyat satış seviyesinde seyrediyor.")
 
                 st.divider()
 
-# --- 9. GEÇMİŞ İŞLEM YÖNETİMİ & DÜZELTME / DEĞİŞTİRME ---
+# --- 9. GEÇMİŞ İŞLEM YÖNETİMİ & DÜZELTME ---
 elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
     st.title("✏️ İşlem Düzeltme, Güncelleme ve Silme")
     tab_buys, tab_sales = st.tabs(["🟢 Alış Lotlarını Düzelt / Sil", "🔴 Satış Kayıtlarını Düzelt / Geri Al"])
@@ -582,7 +600,7 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                 c1, c2, c3, c4, c5, c6 = st.columns([2, 2, 2, 2, 1, 1])
                 c1.write(f"**{lot['ticker']}** (Lot #{lot['lot_id']})")
                 c2.write(f"Portföy: {p_name}")
-                c3.write(f"📅 {lot['buy_date']} | Fiyat: {lot['buy_price']} {lot['currency']}")
+                c3.write(f"📅 {lot['buy_date']} | {format_curr(lot['buy_price'], lot['currency'])}")
                 c4.write(f"Kalan: {lot['remaining_shares']}/{lot['initial_shares']} Lot")
 
                 if c5.button("✏️ Düzenle", key=f"edit_btn_{lot['lot_id']}"):
@@ -641,8 +659,8 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                 c1, c2, c3, c4, c5, c6 = st.columns([2, 2, 2, 2, 1, 1])
                 c1.write(f"**{sale['ticker']}** ({p_name})")
                 c2.write(f"📅 {sale['sale_date']}")
-                c3.write(f"{sale['shares']} Lot @ {sale['sale_price']} {sale['currency']}")
-                c4.write(f"Net K/Z: **{sale['realized_pnl']:+,.2f} {sale['currency']}**")
+                c3.write(f"{sale['shares']} Lot @ {format_curr(sale['sale_price'], sale['currency'])}")
+                c4.write(f"Net K/Z: **{format_curr(sale['realized_pnl'], sale['currency'])}**")
 
                 if c5.button("✏️ Düzenle", key=f"edit_sale_btn_{sale['sale_id']}"):
                     st.session_state.edit_sale_id = int(sale["sale_id"])
@@ -660,7 +678,7 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                     st.success("Satış geri alındı ve lotlar iade edildi.")
                     st.rerun()
 
-# --- 10. PORTFÖY AYARLARI (PORTFÖY SİLME DÜĞMESİ EKLENDİ) ---
+# --- 10. PORTFÖY AYARLARI ---
 elif menu == "⚙️ Portföy Ayarları":
     st.title("⚙️ Portföy Tanımları ve Yönetimi")
     
@@ -686,19 +704,11 @@ elif menu == "⚙️ Portföy Ayarları":
                 p_c1, p_c2 = st.columns([3, 1])
                 p_c1.write(f"📁 **{p['name']}** ({p['currency']})")
                 
-                # Silme düğmesi
                 if p_c2.button("Sil", key=f"del_port_{p['id']}"):
                     with get_connection() as conn:
                         cursor = conn.cursor()
-                        # Bağlı açık lot ve satış kontrolü
-                        cursor.execute("SELECT COUNT(*) FROM lots WHERE portfolio_id = ?", (p['id'],))
-                        has_lots = cursor.fetchone()[0]
-                        cursor.execute("SELECT COUNT(*) FROM sales WHERE portfolio_id = ?", (p['id'],))
-                        has_sales = cursor.fetchone()[0]
-
-                        if has_lots > 0 or has_sales > 0:
-                            cursor.execute("DELETE FROM lots WHERE portfolio_id = ?", (p['id'],))
-                            cursor.execute("DELETE FROM sales WHERE portfolio_id = ?", (p['id'],))
+                        cursor.execute("DELETE FROM lots WHERE portfolio_id = ?", (p['id'],))
+                        cursor.execute("DELETE FROM sales WHERE portfolio_id = ?", (p['id'],))
                         cursor.execute("DELETE FROM portfolios WHERE id = ?", (p['id'],))
                         conn.commit()
                     st.success(f"{p['name']} portföyü silindi.")
