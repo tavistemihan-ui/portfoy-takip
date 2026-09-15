@@ -37,11 +37,17 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Koyu Finans Teması
+# Koyu Finans Teması & Tablo Başlık Alt Satır Desteği
 st.markdown("""
 <style>
     .metric-card { background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
     .stButton>button { border-radius: 6px; }
+    /* Tablo başlıklarının alt satıra geçmesini sağlar */
+    th {
+        white-space: pre-wrap !important;
+        vertical-align: middle !important;
+        text-align: center !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -114,7 +120,7 @@ def check_password():
 if not check_password():
     st.stop()
 
-# --- 3. DÖVİZ KURLARI & HİSSE BİLGİLERİ (FİYAT VE SEKTÖR) ---
+# --- 3. DÖVİZ KURLARI & PİYASA VERİLERİ (FİYAT, SEKTÖR, DÖNEMSEL GETİRİ) ---
 @st.cache_data(ttl=1800)
 def fetch_live_fx_rates():
     rates = {"USD_TRY": 34.20, "EUR_TRY": 37.80, "EUR_USD": 1.10}
@@ -135,7 +141,7 @@ live_rates = fetch_live_fx_rates()
 
 @st.cache_data(ttl=300)
 def get_live_stock_data(ticker: str):
-    """Yahoo Finance üzerinden güncel fiyat ve sektör bilgisini çeker."""
+    """Yahoo Finance üzerinden anlık fiyat ve sektör bilgisini çeker."""
     try:
         t = yf.Ticker(ticker.strip().upper())
         hist = t.history(period="1d")
@@ -145,15 +151,46 @@ def get_live_stock_data(ticker: str):
         else:
             info = t.info
             price = round(float(info.get("regularMarketPrice") or info.get("previousClose") or 0.0), 2)
-        
-        # Sektör bilgisi
         sector = t.info.get("sector", "Diğer")
         return price, sector
     except Exception:
         return 0.0, "Diğer"
 
+@st.cache_data(ttl=600)
+def get_stock_multi_period_performance(ticker: str):
+    """Hissenin 1G, 1H, 1A, 6A, 1Y ve 5Y getirilerini hesaplar."""
+    perf = {"current_price": 0.0, "1D": 0.0, "1W": 0.0, "1M": 0.0, "6M": 0.0, "1Y": 0.0, "5Y": 0.0}
+    try:
+        t = yf.Ticker(ticker.strip().upper())
+        hist = t.history(period="5y")
+        if hist.empty or len(hist) < 2:
+            return perf
+        
+        current_close = float(hist["Close"].iloc[-1])
+        perf["current_price"] = round(current_close, 2)
+
+        def calc_ret(idx_offset):
+            if len(hist) > idx_offset:
+                past_close = float(hist["Close"].iloc[-1 - idx_offset])
+                if past_close > 0:
+                    return ((current_close - past_close) / past_close) * 100
+            return 0.0
+
+        perf["1D"] = calc_ret(1)    # 1 gün önce
+        perf["1W"] = calc_ret(5)    # ~1 hafta (~5 borsa günü)
+        perf["1M"] = calc_ret(21)   # ~1 ay (~21 borsa günü)
+        perf["6M"] = calc_ret(126)  # ~6 ay (~126 borsa günü)
+        perf["1Y"] = calc_ret(252)  # ~1 yıl (~252 borsa günü)
+        
+        # 5 Yıl (varsa en başı)
+        first_close = float(hist["Close"].iloc[0])
+        if first_close > 0 and len(hist) >= 500:
+            perf["5Y"] = ((current_close - first_close) / first_close) * 100
+    except Exception:
+        pass
+    return perf
+
 def format_curr(amount: float, curr: str) -> str:
-    """USD için $ sola, EUR için € sola, TRY için ₺ sola formatlar."""
     if curr == "USD":
         return f"${amount:,.2f}"
     elif curr == "EUR":
@@ -239,7 +276,7 @@ with st.sidebar:
         ]
     )
 
-# --- 6. DASHBOARD (SEKTÖREL VE VARLIK DAĞILIMLI, RENKLİ K/Z) ---
+# --- 6. DASHBOARD ---
 if menu == "📊 Dashboard (Canlı Fiyatlı)":
     lots_df = load_open_lots()
     sales_df = load_sales()
@@ -274,7 +311,7 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
 
             portfolio_rows.append({
                 "Portföy": p["name"],
-                "Toplam Maliyet": format_curr(p_cost_b, base_currency),
+                "Toplam<br>Maliyet": format_curr(p_cost_b, base_currency),
                 "Güncel Piyasa Değeri": format_curr(p_cur_val_b, base_currency),
                 "Piyasa Değeri Ham": p_cur_val_b
             })
@@ -300,7 +337,7 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
         with col2:
             st.subheader("Konsolide Portföy Dağılım Tablosu")
             df_disp = pd.DataFrame(portfolio_rows).drop(columns=["Piyasa Değeri Ham"])
-            st.dataframe(df_disp, hide_index=True, use_container_width=True)
+            st.write(df_disp.to_html(escape=False, index=False), unsafe_allow_html=True)
 
     else:
         p_info = portfolios_df[portfolios_df["id"] == current_p_id].iloc[0]
@@ -331,10 +368,10 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
                 "Kalan Lot": lot["remaining_shares"],
                 "Alış Fiyatı": format_curr(lot['buy_price'], p_info['currency']),
                 "Şimdiki Fiyat": format_curr(effective_price, p_info['currency']),
-                "Toplam Maliyet": format_curr(cost_val, p_info['currency']),
+                "Toplam<br>Maliyet": format_curr(cost_val, p_info['currency']),
                 "Piyasa Değeri": format_curr(market_val, p_info['currency']),
                 "Piyasa Değeri Ham": market_val,
-                "Anlık K/Z Tutarı": format_curr(pnl_val, p_info['currency']),
+                "Anlık K/Z<br>Tutarı": format_curr(pnl_val, p_info['currency']),
                 "Anlık K/Z (%)": pnl_pct
             })
 
@@ -349,7 +386,7 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
 
         st.divider()
 
-        # PASTA GRAFİKLERİ BÖLÜMÜ: VARLIK DAĞILIMI VE SEKTÖREL DAĞILIM
+        # PASTA GRAFİKLERİ
         if lot_details:
             df_lots_full = pd.DataFrame(lot_details)
             g1, g2 = st.columns(2)
@@ -366,19 +403,83 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
                 st.plotly_chart(fig_sector, use_container_width=True)
 
             st.divider()
+
+            # 1. TABLO: AÇIK POZİSYONLAR VE CANLI K/Z
             st.subheader("📌 Açık Pozisyonlar ve Canlı K/Z Durumu")
 
-            # Yüzdeleri pozitifse yeşil, negatifse kırmızı renklendirme
-            def style_returns(val):
-                color = '#2ea043' if val >= 0 else '#f85149'
-                return f'color: {color}; font-weight: bold;'
+            df_table = df_lots_full.drop(columns=["Piyasa Değeri Ham"]).copy()
 
-            df_table = df_lots_full.drop(columns=["Piyasa Değeri Ham"])
-            
-            styled_df = df_table.style.map(style_returns, subset=["Anlık K/Z (%)"]).format({
-                "Anlık K/Z (%)": lambda v: f"%{v:+.2f}"
-            })
-            st.dataframe(styled_df, hide_index=True, use_container_width=True)
+            # Renklendirme ve alt satır formatı için HTML oluşturma
+            def build_custom_html_table(df):
+                html = """<table style="width:100%; border-collapse: collapse; text-align:left;"><thead><tr style="border-bottom: 2px solid #30363d; background-color:#161b22;">"""
+                for col in df.columns:
+                    html += f"""<th style="padding:10px; font-weight:600; color:#c9d1d9;">{col}</th>"""
+                html += "</tr></thead><tbody>"
+
+                for _, row in df.iterrows():
+                    html += "<tr style='border-bottom: 1px solid #21262d;'>"
+                    for col in df.columns:
+                        val = row[col]
+                        if col == "Anlık K/Z (%)":
+                            color = "#2ea043" if val >= 0 else "#f85149"
+                            html += f"<td style='padding:10px; font-weight:bold; color:{color};'>%{val:+.2f}</td>"
+                        elif col == "Anlık K/Z<br>Tutarı":
+                            # Eksi işaretine göre renklendir
+                            color = "#f85149" if "-" in str(val) else "#2ea043"
+                            html += f"<td style='padding:10px; font-weight:600; color:{color};'>{val}</td>"
+                        else:
+                            html += f"<td style='padding:10px; color:#e6edf3;'>{val}</td>"
+                    html += "</tr>"
+                html += "</tbody></table>"
+                return html
+
+            st.write(build_custom_html_table(df_table), unsafe_allow_html=True)
+
+            st.divider()
+
+            # 2. TABLO: DÖNEMSEL GETİRİ ANALİZİ (1G, 1H, 1A, 6A, 1Y, 5Y)
+            st.subheader("📊 Açık Hisselerin Dönemsel Getiri Performansı (Canlı Piyasa)")
+            st.caption("Açık pozisyonlarınızdaki hisselerin geçmiş dönemlerdeki piyasa fiyat değişimleri.")
+
+            unique_tickers = sorted(df_lots_full["Hisse"].unique())
+            period_rows = []
+
+            for sym in unique_tickers:
+                perf = get_stock_multi_period_performance(sym)
+                period_rows.append({
+                    "Hisse": sym,
+                    "Şimdiki Fiyat": format_curr(perf["current_price"], p_info['currency']),
+                    "1 Günlük": perf["1D"],
+                    "1 Haftalık": perf["1W"],
+                    "1 Aylık": perf["1M"],
+                    "6 Aylık": perf["6M"],
+                    "1 Yıllık": perf["1Y"],
+                    "5 Yıllık": perf["5Y"]
+                })
+
+            df_perf = pd.DataFrame(period_rows)
+
+            def build_perf_html_table(df):
+                html = """<table style="width:100%; border-collapse: collapse; text-align:left;"><thead><tr style="border-bottom: 2px solid #30363d; background-color:#161b22;">"""
+                for col in df.columns:
+                    html += f"""<th style="padding:10px; font-weight:600; color:#c9d1d9;">{col}</th>"""
+                html += "</tr></thead><tbody>"
+
+                for _, row in df.iterrows():
+                    html += "<tr style='border-bottom: 1px solid #21262d;'>"
+                    for col in df.columns:
+                        val = row[col]
+                        if col in ["1 Günlük", "1 Haftalık", "1 Aylık", "6 Aylık", "1 Yıllık", "5 Yıllık"]:
+                            color = "#2ea043" if val >= 0 else "#f85149"
+                            html += f"<td style='padding:10px; font-weight:bold; color:{color};'>%{val:+.2f}</td>"
+                        else:
+                            html += f"<td style='padding:10px; color:#e6edf3;'>{val}</td>"
+                    html += "</tr>"
+                html += "</tbody></table>"
+                return html
+
+            st.write(build_perf_html_table(df_perf), unsafe_allow_html=True)
+
         else:
             st.info("Bu portföyde henüz açık hisse bulunmuyor.")
 
