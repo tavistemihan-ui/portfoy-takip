@@ -1,3 +1,10 @@
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+from datetime import datetime
+import io
+
+
 # --- ŞİFRE KORUMA SİSTEMİ ---
 def check_password():
     if "authenticated" not in st.session_state:
@@ -18,11 +25,6 @@ def check_password():
 if not check_password():
     st.stop()  # Şifre doğru girilene kadar uygulamanın geri kalanını çalıştırmaz
 # ----------------------------
-import streamlit as st
-import pandas as pd
-import plotly.express as px
-from datetime import datetime
-import io
 
 st.set_page_config(
     page_title="Portföy Terminal Pro",
