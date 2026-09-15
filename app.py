@@ -14,7 +14,7 @@ def check_password():
         st.title("🔒 Portföy Terminali - Giriş")
         password = st.text_input("Lütfen Parolayı Girin:", type="password")
         if st.button("Giriş Yap", type="primary"):
-            if password == "itportfoy":  # <-- BURAYA KENDİ ŞİFRENİZİ YAZIN
+            if password == "a4mB3kfYjRJ3sGv":  # <-- BURAYA KENDİ ŞİFRENİZİ YAZIN
                 st.session_state.authenticated = True
                 st.rerun()
             else:
