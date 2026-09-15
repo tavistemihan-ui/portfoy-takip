@@ -1,3 +1,23 @@
+# --- ŞİFRE KORUMA SİSTEMİ ---
+def check_password():
+    if "authenticated" not in st.session_state:
+        st.session_state.authenticated = False
+
+    if not st.session_state.authenticated:
+        st.title("🔒 Portföy Terminali - Giriş")
+        password = st.text_input("Lütfen Parolayı Girin:", type="password")
+        if st.button("Giriş Yap", type="primary"):
+            if password == "GizliSifreniz123":  # <-- BURAYA KENDİ ŞİFRENİZİ YAZIN
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("Hatalı parola!")
+        return False
+    return True
+
+if not check_password():
+    st.stop()  # Şifre doğru girilene kadar uygulamanın geri kalanını çalıştırmaz
+# ----------------------------
 import streamlit as st
 import pandas as pd
 import plotly.express as px
