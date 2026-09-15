@@ -5,6 +5,7 @@ from datetime import datetime
 import io
 import requests
 import sqlite3
+import json
 
 
 # --- ŞİFRE KORUMA SİSTEMİ ---
@@ -28,14 +29,6 @@ if not check_password():
     st.stop()  # Şifre doğru girilene kadar uygulamanın geri kalanını çalıştırmaz
 # ----------------------------
 
-import streamlit as st
-import pandas as pd
-import plotly.express as px
-from datetime import datetime
-import io
-import requests
-import sqlite3
-
 st.set_page_config(
     page_title="Portföy Terminal Pro",
     page_icon="💼",
@@ -51,7 +44,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 1. VERİTABANI BAĞLANTISI (KALICI KAYIT) ---
+# --- 1. VERİTABANI BAĞLANTISI ---
 DB_FILE = "portfolio_data.db"
 
 def get_connection():
@@ -60,13 +53,11 @@ def get_connection():
 def init_db():
     with get_connection() as conn:
         c = conn.cursor()
-        # Portföyler tablosu
         c.execute('''CREATE TABLE IF NOT EXISTS portfolios (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
                         name TEXT NOT NULL,
                         currency TEXT NOT NULL)''')
         
-        # Alış Lotları tablosu
         c.execute('''CREATE TABLE IF NOT EXISTS lots (
                         lot_id INTEGER PRIMARY KEY AUTOINCREMENT,
                         portfolio_id INTEGER,
@@ -75,9 +66,9 @@ def init_db():
                         buy_price REAL NOT NULL,
                         initial_shares REAL NOT NULL,
                         remaining_shares REAL NOT NULL,
-                        currency TEXT NOT NULL)''')
+                        currency TEXT NOT NULL,
+                        commission REAL DEFAULT 0.0)''')
         
-        # Satış Kayıtları tablosu
         c.execute('''CREATE TABLE IF NOT EXISTS sales (
                         sale_id INTEGER PRIMARY KEY AUTOINCREMENT,
                         portfolio_id INTEGER,
@@ -86,11 +77,27 @@ def init_db():
                         shares REAL NOT NULL,
                         sale_price REAL NOT NULL,
                         cost REAL NOT NULL,
+                        commission REAL DEFAULT 0.0,
                         realized_pnl REAL NOT NULL,
                         currency TEXT NOT NULL,
+                        current_price REAL DEFAULT NULL,
                         allocations_json TEXT)''')
         
-        # İlk açılışta varsayılan portföyler yoksa ekle
+        # Kolon eksikse ekle (Migration)
+        try:
+            c.execute("ALTER TABLE lots ADD COLUMN commission REAL DEFAULT 0.0")
+        except Exception:
+            pass
+        try:
+            c.execute("ALTER TABLE sales ADD COLUMN commission REAL DEFAULT 0.0")
+        except Exception:
+            pass
+        try:
+            c.execute("ALTER TABLE sales ADD COLUMN current_price REAL DEFAULT NULL")
+        except Exception:
+            pass
+
+        # Varsayılan portföyler
         c.execute("SELECT COUNT(*) FROM portfolios")
         if c.fetchone()[0] == 0:
             c.executemany("INSERT INTO portfolios (name, currency) VALUES (?, ?)", [
@@ -110,7 +117,7 @@ def check_password():
         st.title("🔒 Portföy Terminali - Giriş")
         password = st.text_input("Lütfen Parolayı Girin:", type="password")
         if st.button("Giriş Yap", type="primary"):
-            if password == "1234":  # <-- Şifreniz
+            if password == "1234":
                 st.session_state.authenticated = True
                 st.rerun()
             else:
@@ -165,21 +172,21 @@ def load_portfolios():
 
 def load_open_lots(portfolio_id=None):
     with get_connection() as conn:
-        query = "SELECT * FROM lots WHERE remaining_shares > 0"
+        q = "SELECT * FROM lots WHERE remaining_shares > 0"
         if portfolio_id:
-            query += f" AND portfolio_id = {portfolio_id}"
-        return pd.read_sql(query, conn)
+            q += f" AND portfolio_id = {portfolio_id}"
+        return pd.read_sql(q, conn)
 
 def load_sales(portfolio_id=None):
     with get_connection() as conn:
-        query = "SELECT * FROM sales"
+        q = "SELECT * FROM sales"
         if portfolio_id:
-            query += f" AND portfolio_id = {portfolio_id}"
-        return pd.read_sql(query, conn)
+            q += f" AND portfolio_id = {portfolio_id}"
+        return pd.read_sql(q, conn)
 
 portfolios_df = load_portfolios()
 
-# --- 5. KENAR ÇUBUĞU (SIDEBAR) ---
+# --- 5. SOL MENÜ ---
 with st.sidebar:
     st.title("💼 Portföy Terminali")
     st.caption("🌐 **Canlı Kurlar:**")
@@ -200,7 +207,17 @@ with st.sidebar:
 
     base_currency = st.selectbox("Konsolide Para Birimi", ["USD", "EUR", "TRY"], index=0)
     st.divider()
-    menu = st.radio("Menü", ["📊 Dashboard", "📝 Yeni İşlem / Satış", "📜 İşlem Geçmişi & Yönetim", "⚙️ Portföy Ayarları", "📥 Excel Raporu"])
+    menu = st.radio(
+        "Menü",
+        [
+            "📊 Dashboard",
+            "📝 Yeni İşlem / Satış",
+            "🎯 Satış Sonrası Performans",
+            "📜 İşlem Geçmişi & Yönetim",
+            "⚙️ Portföy Ayarları",
+            "📥 Excel Raporu"
+        ]
+    )
 
 # --- 6. DASHBOARD ---
 if menu == "📊 Dashboard":
@@ -209,7 +226,6 @@ if menu == "📊 Dashboard":
 
     if is_consolidated:
         st.title(f"🌐 Konsolide Portföy ({base_currency})")
-        
         total_val_base = 0.0
         total_pnl_base = 0.0
         summary = []
@@ -229,7 +245,7 @@ if menu == "📊 Dashboard":
 
         c1, c2, c3 = st.columns(3)
         c1.metric(f"Toplam Değer ({base_currency})", f"{total_val_base:,.2f} {base_currency}")
-        c2.metric("Toplam Realize K/Z", f"{total_pnl_base:+,.2f} {base_currency}")
+        c2.metric("Toplam Realize K/Z (Net)", f"{total_pnl_base:+,.2f} {base_currency}")
         c3.metric("Portföy Sayısı", f"{len(portfolios_df)} Adet")
         
         st.divider()
@@ -256,8 +272,8 @@ if menu == "📊 Dashboard":
         pnl = p_sales["realized_pnl"].sum() if not p_sales.empty else 0.0
 
         c1, c2, c3 = st.columns(3)
-        c1.metric("Açık Varlık Tutarı", f"{cost:,.2f} {p_info['currency']}")
-        c2.metric("Realize Kâr/Zarar", f"{pnl:+,.2f} {p_info['currency']}")
+        c1.metric("Mevcut Varlık Tutarı", f"{cost:,.2f} {p_info['currency']}")
+        c2.metric("Realize Kâr/Zarar (Net)", f"{pnl:+,.2f} {p_info['currency']}")
         c3.metric("Açık Lot Kalemi", f"{len(p_lots)} Adet")
 
         st.divider()
@@ -267,9 +283,9 @@ if menu == "📊 Dashboard":
             out_df.columns = ["Hisse", "Alış Tarihi", "Alış Fiyatı", "Kalan Lot", "Birim"]
             st.dataframe(out_df, hide_index=True, use_container_width=True)
         else:
-            st.info("Bu portföyde henüz açık hisse bulunmuyor.")
+            st.info("Bu portföyde henüz hisse bulunmuyor.")
 
-# --- 7. YENİ İŞLEM / SATIŞ (DÜZELTİLEN BÖLÜM) ---
+# --- 7. YENİ İŞLEM / SATIŞ (KOMİSYON ENTEGRELİ) ---
 elif menu == "📝 Yeni İşlem / Satış":
     st.title("📝 İşlem Girişi")
     
@@ -277,30 +293,36 @@ elif menu == "📝 Yeni İşlem / Satış":
     chosen_label = st.selectbox("İşlem Yapılacak Portföy", list(port_dict.keys()))
     target_pid, target_pcurr = port_dict[chosen_label]
 
+    default_comm = 1.50 if target_pcurr == "USD" else 0.0
+
     tx_type = st.radio("İşlem Türü", ["ALIŞ (Yeni Lot Ekle)", "SATIŞ (Parçalı Lot Satışı)"], horizontal=True)
 
     if tx_type.startswith("ALIŞ"):
         st.subheader("Yeni Alış Kaydı")
-        c1, c2, c3, c4 = st.columns(4)
+        c1, c2, c3 = st.columns(3)
         with c1:
             ticker_input = st.text_input("Hisse Kodu (Ticker)", value="AAPL").strip().upper()
         with c2:
             buy_date_input = st.date_input("Alış Tarihi", datetime.now())
         with c3:
             shares_input = st.number_input("Adet (Lot)", min_value=0.01, value=10.0, step=1.0)
+
+        c4, c5 = st.columns(2)
         with c4:
             price_input = st.number_input(f"Alış Fiyatı ({target_pcurr})", min_value=0.01, value=150.0, step=1.0)
+        with c5:
+            comm_input = st.number_input(f"Komisyon ({target_pcurr})", min_value=0.0, value=default_comm, step=0.1)
 
         if st.button("Alışı Kaydet", type="primary"):
             if ticker_input:
                 with get_connection() as conn:
                     cursor = conn.cursor()
                     cursor.execute('''INSERT INTO lots 
-                                      (portfolio_id, ticker, buy_date, buy_price, initial_shares, remaining_shares, currency) 
-                                      VALUES (?, ?, ?, ?, ?, ?, ?)''',
-                                   (target_pid, ticker_input, str(buy_date_input), price_input, shares_input, shares_input, target_pcurr))
+                                      (portfolio_id, ticker, buy_date, buy_price, initial_shares, remaining_shares, currency, commission) 
+                                      VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
+                                   (target_pid, ticker_input, str(buy_date_input), price_input, shares_input, shares_input, target_pcurr, comm_input))
                     conn.commit()
-                st.success(f"{ticker_input} ({shares_input} lot) veritabanına başarıyla kaydedildi!")
+                st.success(f"{ticker_input} ({shares_input} lot) kaydedildi! (Komisyon: {comm_input} {target_pcurr})")
                 st.rerun()
             else:
                 st.error("Lütfen bir hisse kodu girin.")
@@ -314,7 +336,12 @@ elif menu == "📝 Yeni İşlem / Satış":
         else:
             available_tickers = sorted(open_lots_p["ticker"].unique())
             sel_ticker = st.selectbox("Satılacak Hisseyi Seçin", available_tickers)
-            sale_price = st.number_input(f"Satış Fiyatı ({target_pcurr})", min_value=0.01, value=160.0, step=1.0)
+            
+            cs1, cs2 = st.columns(2)
+            with cs1:
+                sale_price = st.number_input(f"Satış Fiyatı ({target_pcurr})", min_value=0.01, value=160.0, step=1.0)
+            with cs2:
+                sale_comm = st.number_input(f"Satış Komisyonu ({target_pcurr})", min_value=0.0, value=default_comm, step=0.1)
 
             ticker_lots = open_lots_p[open_lots_p["ticker"] == sel_ticker]
             st.markdown("#### 🎯 Hangi Alıştan Satış Yapmak İstiyorsunuz?")
@@ -343,34 +370,87 @@ elif menu == "📝 Yeni İşlem / Satış":
 
             if total_sold > 0:
                 proceeds = total_sold * sale_price
-                realized_pnl = proceeds - total_cost
+                # Komisyon realize kârdan düşülür
+                realized_pnl = (proceeds - total_cost) - sale_comm
                 ret_pct = (realized_pnl / total_cost) * 100 if total_cost > 0 else 0
 
                 st.divider()
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Satılacak Toplam Lot", f"{total_sold:.0f}")
-                m2.metric("Toplam Alış Maliyeti", f"{total_cost:,.2f} {target_pcurr}")
-                m3.metric("Satış Geliri", f"{proceeds:,.2f} {target_pcurr}")
-                m4.metric("Realize Kâr/Zarar", f"{realized_pnl:+,.2f} {target_pcurr}", delta=f"%{ret_pct:+.2f}")
+                m1.metric("Satılacak Lot", f"{total_sold:.0f}")
+                m2.metric("Alış Maliyeti", f"{total_cost:,.2f} {target_pcurr}")
+                m3.metric("Satış Geliri (Brüt)", f"{proceeds:,.2f} {target_pcurr}")
+                m4.metric("Net Kâr/Zarar (Komisyon Düşülmüş)", f"{realized_pnl:+,.2f} {target_pcurr}", delta=f"%{ret_pct:+.2f}")
 
                 if st.button("Satışı Onayla ve Tamamla", type="primary"):
-                    import json
                     with get_connection() as conn:
                         cursor = conn.cursor()
-                        # Lot bakiyelerini güncelle
                         for alloc in allocations:
                             cursor.execute("UPDATE lots SET remaining_shares = remaining_shares - ? WHERE lot_id = ?",
                                            (alloc["qty"], alloc["lot_id"]))
-                        # Satış kaydını ekle
                         cursor.execute('''INSERT INTO sales 
-                                          (portfolio_id, ticker, sale_date, shares, sale_price, cost, realized_pnl, currency, allocations_json) 
-                                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                                       (target_pid, sel_ticker, datetime.now().strftime("%Y-%m-%d"), total_sold, sale_price, total_cost, realized_pnl, target_pcurr, json.dumps(allocations)))
+                                          (portfolio_id, ticker, sale_date, shares, sale_price, cost, commission, realized_pnl, currency, current_price, allocations_json) 
+                                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                                       (target_pid, sel_ticker, datetime.now().strftime("%Y-%m-%d"), total_sold, sale_price, total_cost, sale_comm, realized_pnl, target_pcurr, sale_price, json.dumps(allocations)))
                         conn.commit()
-                    st.success("Satış veritabanına işlendi!")
+                    st.success("Satış tamamlandı!")
                     st.rerun()
 
-# --- 8. İŞLEM GEÇMİŞİ VE SİLME ---
+# --- 8. SATIŞ SONRASI PERFORMANS & ERKEN SATIŞ ANALİZİ ---
+elif menu == "🎯 Satış Sonrası Performans":
+    st.title("🎯 Satış Sonrası Karar & Fiyat Analizi")
+    st.caption("Satış yaptığınız fiyat ile güncel fiyatı kıyaslayarak erken çıkış yapıp yapmadığınızı analiz edin.")
+
+    sales_df = load_sales()
+    if sales_df.empty:
+        st.info("Henüz satış işlemi yapılmamış.")
+    else:
+        for idx, sale in sales_df.iterrows():
+            with st.container():
+                st.markdown(f"### 📌 {sale['ticker']} Satışı (#{sale['sale_id']}) - {sale['sale_date']}")
+                
+                c_info1, c_info2, c_info3, c_input = st.columns([2, 2, 2, 3])
+                c_info1.metric("Satılan Adet", f"{sale['shares']} Lot")
+                c_info2.metric("Satış Fiyatı", f"{sale['sale_price']:,.2f} {sale['currency']}")
+                c_info3.metric("Elde Edilen Net K/Z", f"{sale['realized_pnl']:+,.2f} {sale['currency']}")
+
+                # Güncel fiyat girişi (varsayılan satış fiyatı)
+                current_p = sale["current_price"] if pd.notnull(sale["current_price"]) else sale["sale_price"]
+                new_current_price = c_input.number_input(
+                    f"Şu Anki Güncel Fiyat ({sale['currency']})",
+                    min_value=0.01,
+                    value=float(current_p),
+                    step=0.5,
+                    key=f"cur_price_{sale['sale_id']}"
+                )
+
+                # Güncel fiyat değiştiyse DB'ye yaz
+                if new_current_price != current_p:
+                    with get_connection() as conn:
+                        conn.cursor().execute("UPDATE sales SET current_price = ? WHERE sale_id = ?", (new_current_price, sale["sale_id"]))
+                        conn.commit()
+                    st.rerun()
+
+                # Karşılaştırma Analizi
+                diff = new_current_price - sale["sale_price"]
+                diff_pct = (diff / sale["sale_price"]) * 100
+                potential_diff_total = diff * sale["shares"]
+
+                m_col1, m_col2, m_col3 = st.columns(3)
+                if diff > 0:
+                    m_col1.metric("Satıştan Sonra Değişim", f"+%{diff_pct:.2f}", f"+{diff:,.2f} {sale['currency']}")
+                    m_col2.metric("Kaçırılan Potansiyel Kâr", f"+{potential_diff_total:,.2f} {sale['currency']}")
+                    m_col3.warning("⚠️ Satıştan sonra fiyat yükseldi (Erken Satış).")
+                elif diff < 0:
+                    m_col1.metric("Satıştan Sonra Değişim", f"%{diff_pct:.2f}", f"{diff:,.2f} {sale['currency']}")
+                    m_col2.metric("Kurtarılan Sermaye Kaybı", f"{abs(potential_diff_total):,.2f} {sale['currency']}")
+                    m_col3.success("✅ Düşüş öncesi doğru zamanda satıldı.")
+                else:
+                    m_col1.metric("Satıştan Sonra Değişim", "%0.00", f"0.00 {sale['currency']}")
+                    m_col2.write("Fiyat henüz satış seviyesinde.")
+
+                st.divider()
+
+# --- 9. İŞLEM GEÇMİŞİ VE SİLME ---
 elif menu == "📜 İşlem Geçmişi & Yönetim":
     st.title("📜 İşlem Geçmişi ve Kayıt Yönetimi")
     tab_sales, tab_buys = st.tabs(["🔴 Gerçekleşen Satışlar", "🟢 Tüm Alış Lotları"])
@@ -380,27 +460,25 @@ elif menu == "📜 İşlem Geçmişi & Yönetim":
         if sales_df.empty:
             st.info("Kayıtlı satış bulunamadı.")
         else:
-            import json
             for _, sale in sales_df.iterrows():
                 p_row = portfolios_df[portfolios_df["id"] == sale["portfolio_id"]]
-                p_name = p_row.iloc[0]["name"] if not p_row.empty else "Bilinmeyen"
+                p_name = p_row.iloc[0]["name"] if not p_row.empty else ""
                 c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 2])
                 c1.write(f"**{sale['ticker']}** ({p_name})")
                 c2.write(f"📅 {sale['sale_date']}")
-                c3.write(f"{sale['shares']} Lot @ {sale['sale_price']} {sale['currency']}")
-                c4.write(f"K/Z: **{sale['realized_pnl']:+,.2f} {sale['currency']}**")
+                c3.write(f"{sale['shares']} Lot @ {sale['sale_price']} {sale['currency']} (Kom: {sale['commission']})")
+                c4.write(f"Net K/Z: **{sale['realized_pnl']:+,.2f} {sale['currency']}**")
                 
                 if c5.button("🗑️ Satışı Geri Al", key=f"del_sale_{sale['sale_id']}"):
                     allocs = json.loads(sale["allocations_json"])
                     with get_connection() as conn:
                         cursor = conn.cursor()
-                        # Lotları geri iade et
                         for item in allocs:
                             cursor.execute("UPDATE lots SET remaining_shares = remaining_shares + ? WHERE lot_id = ?",
                                            (item["qty"], item["lot_id"]))
                         cursor.execute("DELETE FROM sales WHERE sale_id = ?", (sale["sale_id"],))
                         conn.commit()
-                    st.success("Satış iptal edildi, lotlar iade edildi.")
+                    st.success("Satış geri alındı ve lotlar iade edildi.")
                     st.rerun()
 
     with tab_buys:
@@ -411,11 +489,11 @@ elif menu == "📜 İşlem Geçmişi & Yönetim":
         else:
             for _, lot in all_lots.iterrows():
                 p_row = portfolios_df[portfolios_df["id"] == lot["portfolio_id"]]
-                p_name = p_row.iloc[0]["name"] if not p_row.empty else "Bilinmeyen"
+                p_name = p_row.iloc[0]["name"] if not p_row.empty else ""
                 c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 2])
                 c1.write(f"**{lot['ticker']}** (Lot #{lot['lot_id']})")
                 c2.write(f"Portföy: {p_name}")
-                c3.write(f"📅 {lot['buy_date']}")
+                c3.write(f"📅 {lot['buy_date']} (Kom: {lot['commission']})")
                 c4.write(f"Kalan: {lot['remaining_shares']}/{lot['initial_shares']} Lot")
                 
                 if lot["remaining_shares"] == lot["initial_shares"]:
@@ -423,12 +501,12 @@ elif menu == "📜 İşlem Geçmişi & Yönetim":
                         with get_connection() as conn:
                             conn.cursor().execute("DELETE FROM lots WHERE lot_id = ?", (lot["lot_id"],))
                             conn.commit()
-                        st.success("Alış lotu silindi.")
+                        st.success("Alış silindi.")
                         st.rerun()
                 else:
                     c5.caption("⚠️ Üzerinde satış yapıldığı için silinemez.")
 
-# --- 9. PORTFÖY AYARLARI ---
+# --- 10. PORTFÖY AYARLARI ---
 elif menu == "⚙️ Portföy Ayarları":
     st.title("⚙️ Portföy Tanımları")
     p_name = st.text_input("Portföy Adı", placeholder="Örn: Büyüme Hisseleri")
@@ -441,7 +519,7 @@ elif menu == "⚙️ Portföy Ayarları":
             st.success(f"{p_name} portföyü oluşturuldu.")
             st.rerun()
 
-# --- 10. EXCEL RAPORU ---
+# --- 11. EXCEL RAPORU ---
 elif menu == "📥 Excel Raporu":
     st.title("📥 Excel Raporu İndir")
     with get_connection() as conn:
@@ -450,9 +528,9 @@ elif menu == "📥 Excel Raporu":
     
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df_lots.to_excel(writer, sheet_name="Lotlar", index=False)
+        df_lots.to_excel(writer, sheet_name="Açık_Lotlar", index=False)
         if not df_sales.empty:
-            df_sales.drop(columns=["allocations_json"], errors="ignore").to_excel(writer, sheet_name="Satışlar", index=False)
+            df_sales.drop(columns=["allocations_json"], errors="ignore").to_excel(writer, sheet_name="Satış_Geçmişi", index=False)
     output.seek(0)
 
     st.download_button(
