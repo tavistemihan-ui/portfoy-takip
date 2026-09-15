@@ -4,6 +4,7 @@ import plotly.express as px
 from datetime import datetime
 import io
 import requests
+import sqlite3
 
 
 # --- ŞİFRE KORUMA SİSTEMİ ---
@@ -27,6 +28,14 @@ if not check_password():
     st.stop()  # Şifre doğru girilene kadar uygulamanın geri kalanını çalıştırmaz
 # ----------------------------
 
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+from datetime import datetime
+import io
+import requests
+import sqlite3
+
 st.set_page_config(
     page_title="Portföy Terminal Pro",
     page_icon="💼",
@@ -42,7 +51,58 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 1. ŞİFRE KORUMA EKRANI ---
+# --- 1. VERİTABANI BAĞLANTISI (KALICI KAYIT) ---
+DB_FILE = "portfolio_data.db"
+
+def get_connection():
+    return sqlite3.connect(DB_FILE, check_same_thread=False)
+
+def init_db():
+    with get_connection() as conn:
+        c = conn.cursor()
+        # Portföyler tablosu
+        c.execute('''CREATE TABLE IF NOT EXISTS portfolios (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        name TEXT NOT NULL,
+                        currency TEXT NOT NULL)''')
+        
+        # Alış Lotları tablosu
+        c.execute('''CREATE TABLE IF NOT EXISTS lots (
+                        lot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        portfolio_id INTEGER,
+                        ticker TEXT NOT NULL,
+                        buy_date TEXT NOT NULL,
+                        buy_price REAL NOT NULL,
+                        initial_shares REAL NOT NULL,
+                        remaining_shares REAL NOT NULL,
+                        currency TEXT NOT NULL)''')
+        
+        # Satış Kayıtları tablosu
+        c.execute('''CREATE TABLE IF NOT EXISTS sales (
+                        sale_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        portfolio_id INTEGER,
+                        ticker TEXT NOT NULL,
+                        sale_date TEXT NOT NULL,
+                        shares REAL NOT NULL,
+                        sale_price REAL NOT NULL,
+                        cost REAL NOT NULL,
+                        realized_pnl REAL NOT NULL,
+                        currency TEXT NOT NULL,
+                        allocations_json TEXT)''')
+        
+        # İlk açılışta varsayılan portföyler yoksa ekle
+        c.execute("SELECT COUNT(*) FROM portfolios")
+        if c.fetchone()[0] == 0:
+            c.executemany("INSERT INTO portfolios (name, currency) VALUES (?, ?)", [
+                ("Amerikan Borsası", "USD"),
+                ("Alman Borsası", "EUR"),
+                ("BIST / Türkiye", "TRY")
+            ])
+        conn.commit()
+
+init_db()
+
+# --- 2. ŞİFRE KORUMASI ---
 def check_password():
     if "authenticated" not in st.session_state:
         st.session_state.authenticated = False
@@ -50,7 +110,7 @@ def check_password():
         st.title("🔒 Portföy Terminali - Giriş")
         password = st.text_input("Lütfen Parolayı Girin:", type="password")
         if st.button("Giriş Yap", type="primary"):
-            if password == "1234":  # <-- Şifrenizi buradan değiştirebilirsiniz
+            if password == "1234":  # <-- Şifreniz
                 st.session_state.authenticated = True
                 st.rerun()
             else:
@@ -61,10 +121,9 @@ def check_password():
 if not check_password():
     st.stop()
 
-# --- 2. CANLI KUR VERİSİ ÇEKME ---
-@st.cache_data(ttl=3600)  # Kurları saatte bir günceller
+# --- 3. CANLI DÖVİZ KURLARI ---
+@st.cache_data(ttl=3600)
 def fetch_live_fx_rates():
-    """İnternetten canlı kurları çeker; bağlantı yoksa yedek değerleri döner."""
     rates = {"USD_TRY": 34.20, "EUR_TRY": 37.80, "EUR_USD": 1.10}
     try:
         url = "https://open.er-api.com/v6/latest/USD"
@@ -74,11 +133,7 @@ def fetch_live_fx_rates():
             usd_eur = float(res["rates"].get("EUR", 0.91))
             eur_usd = 1.0 / usd_eur if usd_eur else 1.10
             eur_try = usd_try / usd_eur if usd_eur else 37.80
-            rates = {
-                "USD_TRY": round(usd_try, 2),
-                "EUR_TRY": round(eur_try, 2),
-                "EUR_USD": round(eur_usd, 3)
-            }
+            rates = {"USD_TRY": round(usd_try, 2), "EUR_TRY": round(eur_try, 2), "EUR_USD": round(eur_usd, 3)}
     except Exception:
         pass
     return rates
@@ -103,306 +158,301 @@ def convert_to_base(amount: float, from_curr: str, to_curr: str) -> float:
         return amount_try / live_rates["EUR_TRY"]
     return amount
 
-# --- 3. VERİTABANI VE HAFIZA ---
-if "portfolios" not in st.session_state:
-    st.session_state.portfolios = [
-        {"id": 1, "name": "Amerikan Borsası", "currency": "USD"},
-        {"id": 2, "name": "Alman Borsası", "currency": "EUR"},
-        {"id": 3, "name": "BIST / Türkiye", "currency": "TRY"},
-    ]
+# --- 4. VERİ ÇEKME YARDIMCILARI ---
+def load_portfolios():
+    with get_connection() as conn:
+        return pd.read_sql("SELECT * FROM portfolios", conn)
 
-if "lots" not in st.session_state:
-    st.session_state.lots = [
-        {"lot_id": 1, "portfolio_id": 1, "ticker": "AAPL", "date": "2026-01-01", "buy_price": 200.0, "initial": 50, "remaining": 50, "currency": "USD"},
-        {"lot_id": 2, "portfolio_id": 1, "ticker": "AAPL", "date": "2026-01-10", "buy_price": 210.0, "initial": 120, "remaining": 120, "currency": "USD"},
-        {"lot_id": 3, "portfolio_id": 1, "ticker": "AAPL", "date": "2026-01-20", "buy_price": 190.0, "initial": 100, "remaining": 100, "currency": "USD"},
-        {"lot_id": 4, "portfolio_id": 2, "ticker": "SAP", "date": "2026-02-01", "buy_price": 180.0, "initial": 40, "remaining": 40, "currency": "EUR"},
-        {"lot_id": 5, "portfolio_id": 3, "ticker": "THYAO", "date": "2026-02-15", "buy_price": 290.0, "initial": 500, "remaining": 500, "currency": "TRY"},
-    ]
+def load_open_lots(portfolio_id=None):
+    with get_connection() as conn:
+        query = "SELECT * FROM lots WHERE remaining_shares > 0"
+        if portfolio_id:
+            query += f" AND portfolio_id = {portfolio_id}"
+        return pd.read_sql(query, conn)
 
-if "sales" not in st.session_state:
-    st.session_state.sales = []
+def load_sales(portfolio_id=None):
+    with get_connection() as conn:
+        query = "SELECT * FROM sales"
+        if portfolio_id:
+            query += f" AND portfolio_id = {portfolio_id}"
+        return pd.read_sql(query, conn)
 
-# --- 4. SOL MENÜ (SIDEBAR) ---
+portfolios_df = load_portfolios()
+
+# --- 5. KENAR ÇUBUĞU (SIDEBAR) ---
 with st.sidebar:
     st.title("💼 Portföy Terminali")
-    
-    # Canlı Kur Göstergesi
-    st.caption("🌐 **Canlı Piyasa Kurları:**")
+    st.caption("🌐 **Canlı Kurlar:**")
     st.write(f"USD/TRY: **₺{live_rates['USD_TRY']}** | EUR/TRY: **₺{live_rates['EUR_TRY']}**")
     st.divider()
 
-    portfolio_options = ["🌐 Toplu Portföy (Konsolide)"] + [f"{p['name']} ({p['currency']})" for p in st.session_state.portfolios]
-    selected_p_label = st.selectbox("Aktif Portföy Görünümü", portfolio_options)
+    p_names = ["🌐 Toplu Portföy (Konsolide)"] + [f"{r['name']} ({r['currency']})" for _, r in portfolios_df.iterrows()]
+    selected_p_str = st.selectbox("Aktif Portföy", p_names)
     
-    is_consolidated = selected_p_label.startswith("🌐")
-    current_portfolio = None
+    is_consolidated = selected_p_str.startswith("🌐")
+    current_p_id = None
+    current_p_curr = "USD"
     if not is_consolidated:
-        current_portfolio = next(p for p in st.session_state.portfolios if f"{p['name']} ({p['currency']})" == selected_p_label)
+        matched = portfolios_df[portfolios_df.apply(lambda r: f"{r['name']} ({r['currency']})" == selected_p_str, axis=1)]
+        if not matched.empty:
+            current_p_id = int(matched.iloc[0]["id"])
+            current_p_curr = matched.iloc[0]["currency"]
 
     base_currency = st.selectbox("Konsolide Para Birimi", ["USD", "EUR", "TRY"], index=0)
-    
     st.divider()
-    menu = st.radio(
-        "Menü",
-        ["📊 Dashboard (Mevcut Portföy)", "📝 Yeni İşlem / Satış", "📜 İşlem Geçmişi & Yönetim", "⚙️ Portföy Ayarları", "📥 Excel Raporu"]
-    )
+    menu = st.radio("Menü", ["📊 Dashboard", "📝 Yeni İşlem / Satış", "📜 İşlem Geçmişi & Yönetim", "⚙️ Portföy Ayarları", "📥 Excel Raporu"])
 
-# --- 5. DASHBOARD EKRANI ---
-if menu == "📊 Dashboard (Mevcut Portföy)":
+# --- 6. DASHBOARD ---
+if menu == "📊 Dashboard":
+    lots_df = load_open_lots()
+    sales_df = load_sales()
+
     if is_consolidated:
         st.title(f"🌐 Konsolide Portföy ({base_currency})")
         
-        total_value_base = 0.0
-        total_realized_base = 0.0
-        portfolio_summary = []
+        total_val_base = 0.0
+        total_pnl_base = 0.0
+        summary = []
 
-        for p in st.session_state.portfolios:
-            p_lots = [l for l in st.session_state.lots if l["portfolio_id"] == p["id"] and l["remaining"] > 0]
-            p_cost = sum(l["remaining"] * l["buy_price"] for l in p_lots)
-            p_cost_base = convert_to_base(p_cost, p["currency"], base_currency)
-            total_value_base += p_cost_base
+        for _, p in portfolios_df.iterrows():
+            p_lots = lots_df[lots_df["portfolio_id"] == p["id"]]
+            p_sales = sales_df[sales_df["portfolio_id"] == p["id"]]
+            
+            p_cost = (p_lots["remaining_shares"] * p_lots["buy_price"]).sum()
+            p_cost_b = convert_to_base(p_cost, p["currency"], base_currency)
+            total_val_base += p_cost_b
 
-            p_sales = [s for s in st.session_state.sales if s["portfolio_id"] == p["id"]]
-            p_pnl = sum(s["realized_pnl"] for s in p_sales)
-            total_realized_base += convert_to_base(p_pnl, p["currency"], base_currency)
+            p_pnl = p_sales["realized_pnl"].sum() if not p_sales.empty else 0.0
+            total_pnl_base += convert_to_base(p_pnl, p["currency"], base_currency)
 
-            portfolio_summary.append({
-                "Portföy": p["name"],
-                "Yerel Bakiye": f"{p_cost:,.2f} {p['currency']}",
-                f"Tutar ({base_currency})": p_cost_base,
-            })
+            summary.append({"Portföy": p["name"], "Bakiye": f"{p_cost:,.2f} {p['currency']}", f"Değer ({base_currency})": p_cost_b})
 
-        # KPI Kartları
         c1, c2, c3 = st.columns(3)
-        c1.metric(f"Toplam Değer ({base_currency})", f"{total_value_base:,.2f} {base_currency}")
-        c2.metric("Toplam Realize Kâr/Zarar", f"{total_realized_base:+,.2f} {base_currency}")
-        c3.metric("Aktif Portföy Sayısı", f"{len(st.session_state.portfolios)} Adet")
-
+        c1.metric(f"Toplam Değer ({base_currency})", f"{total_val_base:,.2f} {base_currency}")
+        c2.metric("Toplam Realize K/Z", f"{total_pnl_base:+,.2f} {base_currency}")
+        c3.metric("Portföy Sayısı", f"{len(portfolios_df)} Adet")
+        
         st.divider()
-
-        # Dönemsel Değişim Kartları
-        st.subheader("📅 Portföy Değişim Analizi")
-        d1, d2, d3 = st.columns(3)
-        d1.metric("Günlük Değişim (Tahmini)", f"+%{1.25:.2f}", "+$2,310")
-        d2.metric("Haftalık Değişim (Tahmini)", f"+%{3.80:.2f}", "+$6,850")
-        d3.metric("Aylık Değişim (Tahmini)", f"+%{7.40:.2f}", "+$13,200")
-
-        st.divider()
-        col1, col2 = st.columns([1, 1])
+        col1, col2 = st.columns(2)
         with col1:
-            st.subheader("Portföy Ağırlık Dağılımı")
-            if total_value_base > 0:
-                fig = px.pie(pd.DataFrame(portfolio_summary), names="Portföy", values=f"Tutar ({base_currency})", hole=0.4, template="plotly_dark")
+            st.subheader("Varlık Dağılımı")
+            if total_val_base > 0:
+                fig = px.pie(pd.DataFrame(summary), names="Portföy", values=f"Değer ({base_currency})", hole=0.4, template="plotly_dark")
                 st.plotly_chart(fig, use_container_width=True)
             else:
-                st.info("Açık pozisyon yok.")
-
+                st.info("Portföyde açık hisse yok.")
         with col2:
-            st.subheader("Konsolide Pozisyon Tablosu")
-            st.dataframe(pd.DataFrame(portfolio_summary), hide_index=True, use_container_width=True)
+            st.subheader("Portföy Özeti")
+            st.dataframe(pd.DataFrame(summary), hide_index=True, use_container_width=True)
 
     else:
-        st.title(f"📊 {current_portfolio['name']} ({current_portfolio['currency']})")
-        p_lots = [l for l in st.session_state.lots if l["portfolio_id"] == current_portfolio["id"] and l["remaining"] > 0]
-        p_sales = [s for s in st.session_state.sales if s["portfolio_id"] == current_portfolio["id"]]
+        p_info = portfolios_df[portfolios_df["id"] == current_p_id].iloc[0]
+        st.title(f"📊 {p_info['name']} ({p_info['currency']})")
+        
+        p_lots = lots_df[lots_df["portfolio_id"] == current_p_id]
+        p_sales = sales_df[sales_df["portfolio_id"] == current_p_id]
 
-        total_cost = sum(l["remaining"] * l["buy_price"] for l in p_lots)
-        total_pnl = sum(s["realized_pnl"] for s in p_sales)
+        cost = (p_lots["remaining_shares"] * p_lots["buy_price"]).sum()
+        pnl = p_sales["realized_pnl"].sum() if not p_sales.empty else 0.0
 
         c1, c2, c3 = st.columns(3)
-        c1.metric("Mevcut Varlık Tutarı", f"{total_cost:,.2f} {current_portfolio['currency']}")
-        c2.metric("Realize Kâr/Zarar", f"{total_pnl:+,.2f} {current_portfolio['currency']}")
-        c3.metric("Açık Lot Sayısı", f"{len(p_lots)} Kalem")
+        c1.metric("Açık Varlık Tutarı", f"{cost:,.2f} {p_info['currency']}")
+        c2.metric("Realize Kâr/Zarar", f"{pnl:+,.2f} {p_info['currency']}")
+        c3.metric("Açık Lot Kalemi", f"{len(p_lots)} Adet")
 
         st.divider()
-
-        # Dönemsel Değişim Kartları
-        st.subheader("📅 Portföy Değişim Analizi")
-        d1, d2, d3 = st.columns(3)
-        d1.metric("Günlük Değişim", "+%0.85", f"+{total_cost * 0.0085:,.2f} {current_portfolio['currency']}")
-        d2.metric("Haftalık Değişim", "+%2.40", f"+{total_cost * 0.024:,.2f} {current_portfolio['currency']}")
-        d3.metric("Aylık Değişim", "+%5.60", f"+{total_cost * 0.056:,.2f} {current_portfolio['currency']}")
-
-        st.divider()
-        st.subheader("📌 Portföydeki Açık Pozisyonlar")
-        if p_lots:
-            df_open = pd.DataFrame(p_lots)[["ticker", "date", "buy_price", "remaining", "currency"]]
-            df_open.columns = ["Hisse", "Alış Tarihi", "Alış Fiyatı", "Kalan Lot", "Para Birimi"]
-            st.dataframe(df_open, hide_index=True, use_container_width=True)
+        st.subheader("📌 Açık Pozisyonlar")
+        if not p_lots.empty:
+            out_df = p_lots[["ticker", "buy_date", "buy_price", "remaining_shares", "currency"]].copy()
+            out_df.columns = ["Hisse", "Alış Tarihi", "Alış Fiyatı", "Kalan Lot", "Birim"]
+            st.dataframe(out_df, hide_index=True, use_container_width=True)
         else:
-            st.info("Bu portföyde henüz hisse bulunmuyor.")
+            st.info("Bu portföyde henüz açık hisse bulunmuyor.")
 
-# --- 6. İŞLEM GEÇMİŞİ PENCERESİ (AYRI PENCERE) ---
-elif menu == "📜 İşlem Geçmişi & Yönetim":
-    st.title("📜 Alım-Satım Geçmişi ve Kayıt Yönetimi")
-    
-    tab_sales, tab_buys = st.tabs(["🔴 Gerçekleşen Satışlar", "🟢 Alış Lotları ve İptal"])
-
-    with tab_sales:
-        st.subheader("Geçmiş Satış Kayıtları")
-        if not st.session_state.sales:
-            st.write("Henüz yapılmış bir satış kaydı bulunmuyor.")
-        else:
-            for sale in list(st.session_state.sales):
-                p_name = next(p["name"] for p in st.session_state.portfolios if p["id"] == sale["portfolio_id"])
-                c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 2])
-                c1.write(f"**{sale['ticker']}** ({p_name})")
-                c2.write(f"📅 {sale['date']}")
-                c3.write(f"{sale['shares']} Lot @ {sale['sale_price']} {sale['currency']}")
-                c4.write(f"K/Z: **{sale['realized_pnl']:+,.2f} {sale['currency']}**")
-                
-                if c5.button("🗑️ Satışı Geri Al", key=f"del_sale_{sale['sale_id']}"):
-                    for item in sale["allocations"]:
-                        lot = next((l for l in st.session_state.lots if l["lot_id"] == item["lot_id"]), None)
-                        if lot:
-                            lot["remaining"] += item["qty"]
-                    st.session_state.sales = [s for s in st.session_state.sales if s["sale_id"] != sale["sale_id"]]
-                    st.success(f"Satış iptal edildi ve lotlar alış kayıtlarına geri eklendi.")
-                    st.rerun()
-
-    with tab_buys:
-        st.subheader("Tüm Alış Kayıtları")
-        for lot in list(st.session_state.lots):
-            p_name = next(p["name"] for p in st.session_state.portfolios if p["id"] == lot["portfolio_id"])
-            c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 2])
-            c1.write(f"**{lot['ticker']}** (Lot #{lot['lot_id']})")
-            c2.write(f"Portföy: {p_name}")
-            c3.write(f"📅 {lot['date']}")
-            c4.write(f"Kalan: {lot['remaining']}/{lot['initial']} Lot")
-            
-            if lot["remaining"] == lot["initial"]:
-                if c5.button("🗑️ Alışı Sil", key=f"del_lot_{lot['lot_id']}"):
-                    st.session_state.lots = [l for l in st.session_state.lots if l["lot_id"] != lot["lot_id"]]
-                    st.success(f"Lot #{lot['lot_id']} kaydı silindi.")
-                    st.rerun()
-            else:
-                c5.caption("⚠️ Üzerinde satış yapıldığı için silinemez.")
-
-# --- 7. YENİ İŞLEM / SATIŞ ---
+# --- 7. YENİ İŞLEM / SATIŞ (DÜZELTİLEN BÖLÜM) ---
 elif menu == "📝 Yeni İşlem / Satış":
-    st.title("📝 Yeni İşlem Girişi")
-    target_p = st.selectbox("İşlem Yapılacak Portföy", st.session_state.portfolios, format_func=lambda x: f"{x['name']} ({x['currency']})")
-    tx_type = st.radio("İşlem Türü", ["ALIŞ (Yeni Lot)", "SATIŞ (Parçalı Lot Satışı)"], horizontal=True)
+    st.title("📝 İşlem Girişi")
+    
+    port_dict = {f"{r['name']} ({r['currency']})": (r['id'], r['currency']) for _, r in portfolios_df.iterrows()}
+    chosen_label = st.selectbox("İşlem Yapılacak Portföy", list(port_dict.keys()))
+    target_pid, target_pcurr = port_dict[chosen_label]
+
+    tx_type = st.radio("İşlem Türü", ["ALIŞ (Yeni Lot Ekle)", "SATIŞ (Parçalı Lot Satışı)"], horizontal=True)
 
     if tx_type.startswith("ALIŞ"):
         st.subheader("Yeni Alış Kaydı")
         c1, c2, c3, c4 = st.columns(4)
         with c1:
-            ticker = st.text_input("Hisse Kodu (Ticker)", value="AAPL").upper()
+            ticker_input = st.text_input("Hisse Kodu (Ticker)", value="AAPL").strip().upper()
         with c2:
-            buy_date = st.date_input("Alış Tarihi", datetime.now())
+            buy_date_input = st.date_input("Alış Tarihi", datetime.now())
         with c3:
-            shares = st.number_input("Adet (Lot)", min_value=1.0, value=10.0, step=1.0)
+            shares_input = st.number_input("Adet (Lot)", min_value=0.01, value=10.0, step=1.0)
         with c4:
-            price = st.number_input(f"Alış Fiyatı ({target_p['currency']})", min_value=0.01, value=150.0, step=1.0)
+            price_input = st.number_input(f"Alış Fiyatı ({target_pcurr})", min_value=0.01, value=150.0, step=1.0)
 
         if st.button("Alışı Kaydet", type="primary"):
-            new_lot_id = max([l["lot_id"] for l in st.session_state.lots], default=0) + 1
-            st.session_state.lots.append({
-                "lot_id": new_lot_id,
-                "portfolio_id": target_p["id"],
-                "ticker": ticker,
-                "date": str(buy_date),
-                "buy_price": price,
-                "initial": shares,
-                "remaining": shares,
-                "currency": target_p["currency"]
-            })
-            st.success(f"{ticker} alışı kaydedildi!")
-            st.rerun()
+            if ticker_input:
+                with get_connection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute('''INSERT INTO lots 
+                                      (portfolio_id, ticker, buy_date, buy_price, initial_shares, remaining_shares, currency) 
+                                      VALUES (?, ?, ?, ?, ?, ?, ?)''',
+                                   (target_pid, ticker_input, str(buy_date_input), price_input, shares_input, shares_input, target_pcurr))
+                    conn.commit()
+                st.success(f"{ticker_input} ({shares_input} lot) veritabanına başarıyla kaydedildi!")
+                st.rerun()
+            else:
+                st.error("Lütfen bir hisse kodu girin.")
 
     else:
         st.subheader("Parçalı Lot Satışı")
-        open_lots = [l for l in st.session_state.lots if l["portfolio_id"] == target_p["id"] and l["remaining"] > 0]
-        tickers = sorted(list(set(l["ticker"] for l in open_lots)))
+        open_lots_p = load_open_lots(target_pid)
 
-        if not tickers:
-            st.warning(f"{target_p['name']} portföyünde satılabilecek hisse yok.")
+        if open_lots_p.empty:
+            st.warning("Bu portföyde satılabilecek hisse bulunmuyor.")
         else:
-            selected_ticker = st.selectbox("Satılacak Hisseyi Seçin", tickers)
-            sale_price = st.number_input(f"Satış Fiyatı ({target_p['currency']})", min_value=0.01, value=160.0, step=1.0)
-            ticker_lots = [l for l in open_lots if l["ticker"] == selected_ticker]
-            
+            available_tickers = sorted(open_lots_p["ticker"].unique())
+            sel_ticker = st.selectbox("Satılacak Hisseyi Seçin", available_tickers)
+            sale_price = st.number_input(f"Satış Fiyatı ({target_pcurr})", min_value=0.01, value=160.0, step=1.0)
+
+            ticker_lots = open_lots_p[open_lots_p["ticker"] == sel_ticker]
             st.markdown("#### 🎯 Hangi Alıştan Satış Yapmak İstiyorsunuz?")
+
             allocations = []
-            total_sell = 0.0
+            total_sold = 0.0
             total_cost = 0.0
 
-            for lot in ticker_lots:
+            for _, lot in ticker_lots.iterrows():
                 c1, c2, c3, c4 = st.columns([2, 2, 2, 3])
-                c1.write(f"📅 **{lot['date']}**")
+                c1.write(f"📅 **{lot['buy_date']}**")
                 c2.write(f"Alış: **{lot['buy_price']} {lot['currency']}**")
-                c3.write(f"Kalan: **{lot['remaining']} lot**")
+                c3.write(f"Kalan: **{lot['remaining_shares']} lot**")
                 qty = c4.number_input(
                     f"Sat (Lot #{lot['lot_id']})",
                     min_value=0.0,
-                    max_value=float(lot["remaining"]),
+                    max_value=float(lot["remaining_shares"]),
                     value=0.0,
                     step=1.0,
                     key=f"sell_{lot['lot_id']}"
                 )
                 if qty > 0:
-                    allocations.append({"lot_id": lot["lot_id"], "qty": qty, "buy_price": lot["buy_price"]})
-                    total_sell += qty
+                    allocations.append({"lot_id": int(lot["lot_id"]), "qty": qty, "buy_price": lot["buy_price"]})
+                    total_sold += qty
                     total_cost += (qty * lot["buy_price"])
 
-            if total_sell > 0:
-                proceeds = total_sell * sale_price
+            if total_sold > 0:
+                proceeds = total_sold * sale_price
                 realized_pnl = proceeds - total_cost
                 ret_pct = (realized_pnl / total_cost) * 100 if total_cost > 0 else 0
 
                 st.divider()
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Satılacak Toplam Lot", f"{total_sell:.0f}")
-                m2.metric("Toplam Alış Maliyeti", f"{total_cost:,.2f} {target_p['currency']}")
-                m3.metric("Satış Geliri", f"{proceeds:,.2f} {target_p['currency']}")
-                m4.metric("Realize Kâr/Zarar", f"{realized_pnl:+,.2f} {target_p['currency']}", delta=f"%{ret_pct:+.2f}")
+                m1.metric("Satılacak Toplam Lot", f"{total_sold:.0f}")
+                m2.metric("Toplam Alış Maliyeti", f"{total_cost:,.2f} {target_pcurr}")
+                m3.metric("Satış Geliri", f"{proceeds:,.2f} {target_pcurr}")
+                m4.metric("Realize Kâr/Zarar", f"{realized_pnl:+,.2f} {target_pcurr}", delta=f"%{ret_pct:+.2f}")
 
-                if st.button("Satışı Tamamla", type="primary"):
-                    new_sale_id = max([s["sale_id"] for s in st.session_state.sales], default=0) + 1
-                    for item in allocations:
-                        lot = next(l for l in st.session_state.lots if l["lot_id"] == item["lot_id"])
-                        lot["remaining"] -= item["qty"]
-
-                    st.session_state.sales.append({
-                        "sale_id": new_sale_id,
-                        "portfolio_id": target_p["id"],
-                        "ticker": selected_ticker,
-                        "date": datetime.now().strftime("%Y-%m-%d"),
-                        "shares": total_sell,
-                        "sale_price": sale_price,
-                        "cost": total_cost,
-                        "realized_pnl": realized_pnl,
-                        "currency": target_p["currency"],
-                        "allocations": allocations
-                    })
-                    st.success("Satış gerçekleşti!")
+                if st.button("Satışı Onayla ve Tamamla", type="primary"):
+                    import json
+                    with get_connection() as conn:
+                        cursor = conn.cursor()
+                        # Lot bakiyelerini güncelle
+                        for alloc in allocations:
+                            cursor.execute("UPDATE lots SET remaining_shares = remaining_shares - ? WHERE lot_id = ?",
+                                           (alloc["qty"], alloc["lot_id"]))
+                        # Satış kaydını ekle
+                        cursor.execute('''INSERT INTO sales 
+                                          (portfolio_id, ticker, sale_date, shares, sale_price, cost, realized_pnl, currency, allocations_json) 
+                                          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)''',
+                                       (target_pid, sel_ticker, datetime.now().strftime("%Y-%m-%d"), total_sold, sale_price, total_cost, realized_pnl, target_pcurr, json.dumps(allocations)))
+                        conn.commit()
+                    st.success("Satış veritabanına işlendi!")
                     st.rerun()
 
-# --- 8. PORTFÖY AYARLARI ---
+# --- 8. İŞLEM GEÇMİŞİ VE SİLME ---
+elif menu == "📜 İşlem Geçmişi & Yönetim":
+    st.title("📜 İşlem Geçmişi ve Kayıt Yönetimi")
+    tab_sales, tab_buys = st.tabs(["🔴 Gerçekleşen Satışlar", "🟢 Tüm Alış Lotları"])
+
+    with tab_sales:
+        sales_df = load_sales()
+        if sales_df.empty:
+            st.info("Kayıtlı satış bulunamadı.")
+        else:
+            import json
+            for _, sale in sales_df.iterrows():
+                p_row = portfolios_df[portfolios_df["id"] == sale["portfolio_id"]]
+                p_name = p_row.iloc[0]["name"] if not p_row.empty else "Bilinmeyen"
+                c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 2])
+                c1.write(f"**{sale['ticker']}** ({p_name})")
+                c2.write(f"📅 {sale['sale_date']}")
+                c3.write(f"{sale['shares']} Lot @ {sale['sale_price']} {sale['currency']}")
+                c4.write(f"K/Z: **{sale['realized_pnl']:+,.2f} {sale['currency']}**")
+                
+                if c5.button("🗑️ Satışı Geri Al", key=f"del_sale_{sale['sale_id']}"):
+                    allocs = json.loads(sale["allocations_json"])
+                    with get_connection() as conn:
+                        cursor = conn.cursor()
+                        # Lotları geri iade et
+                        for item in allocs:
+                            cursor.execute("UPDATE lots SET remaining_shares = remaining_shares + ? WHERE lot_id = ?",
+                                           (item["qty"], item["lot_id"]))
+                        cursor.execute("DELETE FROM sales WHERE sale_id = ?", (sale["sale_id"],))
+                        conn.commit()
+                    st.success("Satış iptal edildi, lotlar iade edildi.")
+                    st.rerun()
+
+    with tab_buys:
+        with get_connection() as conn:
+            all_lots = pd.read_sql("SELECT * FROM lots", conn)
+        if all_lots.empty:
+            st.info("Kayıtlı alış bulunmuyor.")
+        else:
+            for _, lot in all_lots.iterrows():
+                p_row = portfolios_df[portfolios_df["id"] == lot["portfolio_id"]]
+                p_name = p_row.iloc[0]["name"] if not p_row.empty else "Bilinmeyen"
+                c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 2, 2])
+                c1.write(f"**{lot['ticker']}** (Lot #{lot['lot_id']})")
+                c2.write(f"Portföy: {p_name}")
+                c3.write(f"📅 {lot['buy_date']}")
+                c4.write(f"Kalan: {lot['remaining_shares']}/{lot['initial_shares']} Lot")
+                
+                if lot["remaining_shares"] == lot["initial_shares"]:
+                    if c5.button("🗑️ Alışı Sil", key=f"del_lot_{lot['lot_id']}"):
+                        with get_connection() as conn:
+                            conn.cursor().execute("DELETE FROM lots WHERE lot_id = ?", (lot["lot_id"],))
+                            conn.commit()
+                        st.success("Alış lotu silindi.")
+                        st.rerun()
+                else:
+                    c5.caption("⚠️ Üzerinde satış yapıldığı için silinemez.")
+
+# --- 9. PORTFÖY AYARLARI ---
 elif menu == "⚙️ Portföy Ayarları":
-    st.title("⚙️ Portföy Ayarları")
-    p_name = st.text_input("Yeni Portföy Adı", placeholder="Örn: Temettü Portföyü")
+    st.title("⚙️ Portföy Tanımları")
+    p_name = st.text_input("Portföy Adı", placeholder="Örn: Büyüme Hisseleri")
     p_curr = st.selectbox("Para Birimi", ["USD", "EUR", "TRY"])
-    if st.button("Portföyü Kaydet", type="primary"):
-        if p_name:
-            new_id = max([p["id"] for p in st.session_state.portfolios], default=0) + 1
-            st.session_state.portfolios.append({"id": new_id, "name": p_name, "currency": p_curr})
+    if st.button("Yeni Portföy Oluştur", type="primary"):
+        if p_name.strip():
+            with get_connection() as conn:
+                conn.cursor().execute("INSERT INTO portfolios (name, currency) VALUES (?, ?)", (p_name.strip(), p_curr))
+                conn.commit()
             st.success(f"{p_name} portföyü oluşturuldu.")
             st.rerun()
 
-# --- 9. EXCEL RAPORU ---
+# --- 10. EXCEL RAPORU ---
 elif menu == "📥 Excel Raporu":
     st.title("📥 Excel Raporu İndir")
-    df_lots = pd.DataFrame(st.session_state.lots)
-    df_sales = pd.DataFrame(st.session_state.sales)
+    with get_connection() as conn:
+        df_lots = pd.read_sql("SELECT * FROM lots", conn)
+        df_sales = pd.read_sql("SELECT * FROM sales", conn)
     
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df_lots.to_excel(writer, sheet_name="Açık_Lotlar", index=False)
+        df_lots.to_excel(writer, sheet_name="Lotlar", index=False)
         if not df_sales.empty:
-            df_sales.drop(columns=["allocations"], errors="ignore").to_excel(writer, sheet_name="Satış_Geçmişi", index=False)
+            df_sales.drop(columns=["allocations_json"], errors="ignore").to_excel(writer, sheet_name="Satışlar", index=False)
     output.seek(0)
 
     st.download_button(
