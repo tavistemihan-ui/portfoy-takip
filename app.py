@@ -12,7 +12,6 @@ import yfinance as yf
 # PostgreSQL desteği (Neon DB)
 try:
     import psycopg2
-    from psycopg2.extras import RealDictCursor
     PG_AVAILABLE = True
 except ImportError:
     PG_AVAILABLE = False
@@ -48,7 +47,6 @@ IS_POSTGRES = DATABASE_URL is not None and DATABASE_URL.startswith("postgres") a
 
 def get_connection():
     if IS_POSTGRES:
-        # channel_binding parametresi bazen psycopg2 kütüphanesinde uyarı verebilir, temizleyelim
         clean_url = DATABASE_URL.replace("&channel_binding=require", "").replace("?channel_binding=require", "")
         return psycopg2.connect(clean_url)
     return sqlite3.connect("portfolio_data.db", check_same_thread=False)
@@ -134,13 +132,13 @@ def init_db():
 
 init_db()
 
-# --- 2. DÖVİZ KURLARI & PİYASA VERİLERİ ---
-@st.cache_data(ttl=1800)
+# --- 2. DÖVİZ KURLARI & OPTİMİZE EDİLMİŞ CANLI VERİ ÇEKİMİ ---
+@st.cache_data(ttl=3600)
 def fetch_live_fx_rates():
     rates = {"USD_TRY": 34.20, "EUR_TRY": 37.80, "EUR_USD": 1.10}
     try:
         url = "https://open.er-api.com/v6/latest/USD"
-        res = requests.get(url, timeout=5).json()
+        res = requests.get(url, timeout=3).json()
         if res and "rates" in res:
             usd_try = float(res["rates"].get("TRY", 34.20))
             usd_eur = float(res["rates"].get("EUR", 0.91))
@@ -153,53 +151,54 @@ def fetch_live_fx_rates():
 
 live_rates = fetch_live_fx_rates()
 
-@st.cache_data(ttl=300)
-def get_live_stock_data(ticker: str):
-    try:
-        t = yf.Ticker(ticker.strip().upper())
-        hist = t.history(period="1d")
-        price = 0.0
-        if not hist.empty:
-            price = round(float(hist["Close"].iloc[-1]), 2)
-        else:
-            info = t.info
-            price = round(float(info.get("regularMarketPrice") or info.get("previousClose") or 0.0), 2)
-        sector = t.info.get("sector", "Diğer")
-        return price, sector
-    except Exception:
-        return 0.0, "Diğer"
-
 @st.cache_data(ttl=600)
-def get_stock_multi_period_performance(ticker: str):
-    perf = {"current_price": 0.0, "1D": 0.0, "1W": 0.0, "1M": 0.0, "6M": 0.0, "1Y": 0.0, "5Y": 0.0}
+def get_batch_market_data(tickers_tuple):
+    """Tüm hisselerin fiyat ve dönemsel verilerini tek seferde topluca çeker (Çok Hızlıdır)."""
+    result = {}
+    if not tickers_tuple:
+        return result
+
+    ticker_str = " ".join([t.strip().upper() for t in tickers_tuple])
     try:
-        t = yf.Ticker(ticker.strip().upper())
-        hist = t.history(period="5y")
-        if hist.empty or len(hist) < 2:
-            return perf
+        # Son 1 yıllık verileri tek seferde indirir
+        data = yf.download(ticker_str, period="1y", interval="1d", group_by="ticker", threads=True, progress=False)
         
-        current_close = float(hist["Close"].iloc[-1])
-        perf["current_price"] = round(current_close, 2)
+        for sym in tickers_tuple:
+            sym_clean = sym.strip().upper()
+            sub_df = data[sym_clean] if len(tickers_tuple) > 1 else data
 
-        def calc_ret(idx_offset):
-            if len(hist) > idx_offset:
-                past_close = float(hist["Close"].iloc[-1 - idx_offset])
-                if past_close > 0:
-                    return ((current_close - past_close) / past_close) * 100
-            return 0.0
+            if not sub_df.empty and "Close" in sub_df:
+                closes = sub_df["Close"].dropna()
+                if len(closes) >= 2:
+                    current_p = round(float(closes.iloc[-1]), 2)
+                    
+                    def get_p_ret(offset):
+                        if len(closes) > offset:
+                            past = float(closes.iloc[-1 - offset])
+                            return round(((current_p - past) / past) * 100, 2)
+                        return 0.0
 
-        perf["1D"] = calc_ret(1)
-        perf["1W"] = calc_ret(5)
-        perf["1M"] = calc_ret(21)
-        perf["6M"] = calc_ret(126)
-        perf["1Y"] = calc_ret(252)
-        
-        first_close = float(hist["Close"].iloc[0])
-        if first_close > 0 and len(hist) >= 500:
-            perf["5Y"] = ((current_close - first_close) / first_close) * 100
+                    result[sym_clean] = {
+                        "price": current_p,
+                        "1D": get_p_ret(1),
+                        "1W": get_p_ret(5),
+                        "1M": get_p_ret(21),
+                        "6M": get_p_ret(126),
+                        "1Y": get_p_ret(250),
+                        "5Y": 0.0,
+                        "sector": "Genel"
+                    }
     except Exception:
         pass
-    return perf
+
+    # Eksik kalan hisseler için basit fallback
+    for sym in tickers_tuple:
+        sym_clean = sym.strip().upper()
+        if sym_clean not in result:
+            result[sym_clean] = {
+                "price": 0.0, "1D": 0.0, "1W": 0.0, "1M": 0.0, "6M": 0.0, "1Y": 0.0, "5Y": 0.0, "sector": "Genel"
+            }
+    return result
 
 def format_curr(amount: float, curr: str) -> str:
     if curr == "USD":
@@ -264,7 +263,6 @@ if "edit_sale_id" not in st.session_state:
 with st.sidebar:
     st.title("💼 Portföy Terminali")
     
-    # Veritabanı durum rozeti
     if IS_POSTGRES:
         st.success("🟢 Bulut Veritabanı Bağlı (Neon)")
     else:
@@ -305,6 +303,10 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
     lots_df = load_open_lots()
     sales_df = load_sales()
 
+    # Açık olan tüm hisseleri topluca tek ağ isteğiyle çek
+    all_open_tickers = tuple(sorted(lots_df["ticker"].unique())) if not lots_df.empty else ()
+    market_cache = get_batch_market_data(all_open_tickers)
+
     if is_consolidated:
         st.title(f"🌐 Konsolide Portföy ({base_currency})")
         
@@ -323,8 +325,8 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
 
             p_cur_val = 0.0
             for _, lot in p_lots.iterrows():
-                lp, _ = get_live_stock_data(lot["ticker"])
-                cur_p = lp if lp > 0 else lot["buy_price"]
+                m_info = market_cache.get(lot["ticker"].strip().upper(), {})
+                cur_p = m_info.get("price", 0.0) or lot["buy_price"]
                 p_cur_val += lot["remaining_shares"] * cur_p
             
             p_cur_val_b = convert_to_base(p_cur_val, p["currency"], base_currency)
@@ -377,8 +379,10 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
         total_market_val = 0.0
 
         for _, lot in p_lots.iterrows():
-            live_p, sector = get_live_stock_data(lot["ticker"])
-            effective_price = live_p if live_p > 0 else lot["buy_price"]
+            sym = lot["ticker"].strip().upper()
+            m_info = market_cache.get(sym, {})
+            effective_price = m_info.get("price", 0.0) or lot["buy_price"]
+            
             market_val = lot["remaining_shares"] * effective_price
             cost_val = lot["remaining_shares"] * lot["buy_price"]
             pnl_val = market_val - cost_val
@@ -386,8 +390,8 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
             total_market_val += market_val
 
             lot_details.append({
-                "Hisse": lot["ticker"],
-                "Sektör": sector,
+                "Hisse": sym,
+                "Sektör": m_info.get("sector", "Genel"),
                 "Alış Tarihi": lot["buy_date"],
                 "Kalan Lot": lot["remaining_shares"],
                 "Alış Fiyatı": format_curr(lot['buy_price'], p_info['currency']),
@@ -455,22 +459,19 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
             st.write(build_custom_html_table(df_table), unsafe_allow_html=True)
 
             st.divider()
-            st.subheader("📊 Açık Hisselerin Dönemsel Getiri Performansı (Canlı Piyasa)")
+            st.subheader("📊 Açık Hisselerin Dönemsel Getiri Performansı")
 
-            unique_tickers = sorted(df_lots_full["Hisse"].unique())
             period_rows = []
-
-            for sym in unique_tickers:
-                perf = get_stock_multi_period_performance(sym)
+            for sym in sorted(df_lots_full["Hisse"].unique()):
+                m_info = market_cache.get(sym, {})
                 period_rows.append({
                     "Hisse": sym,
-                    "Şimdiki Fiyat": format_curr(perf["current_price"], p_info['currency']),
-                    "1 Günlük": perf["1D"],
-                    "1 Haftalık": perf["1W"],
-                    "1 Aylık": perf["1M"],
-                    "6 Aylık": perf["6M"],
-                    "1 Yıllık": perf["1Y"],
-                    "5 Yıllık": perf["5Y"]
+                    "Şimdiki Fiyat": format_curr(m_info.get("price", 0.0), p_info['currency']),
+                    "1 Günlük": m_info.get("1D", 0.0),
+                    "1 Haftalık": m_info.get("1W", 0.0),
+                    "1 Aylık": m_info.get("1M", 0.0),
+                    "6 Aylık": m_info.get("6M", 0.0),
+                    "1 Yıllık": m_info.get("1Y", 0.0)
                 })
 
             df_perf = pd.DataFrame(period_rows)
@@ -485,7 +486,7 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
                     html += "<tr style='border-bottom: 1px solid #21262d;'>"
                     for col in df.columns:
                         val = row[col]
-                        if col in ["1 Günlük", "1 Haftalık", "1 Aylık", "6 Aylık", "1 Yıllık", "5 Yıllık"]:
+                        if col in ["1 Günlük", "1 Haftalık", "1 Aylık", "6 Aylık", "1 Yıllık"]:
                             color = "#2ea043" if val >= 0 else "#f85149"
                             html += f"<td style='padding:10px; font-weight:bold; color:{color};'>%{val:+.2f}</td>"
                         else:
@@ -536,6 +537,7 @@ elif menu == "📝 Yeni İşlem / Satış":
                 conn.commit()
                 cursor.close()
                 conn.close()
+                st.cache_data.clear()
                 st.success(f"{ticker_input} ({shares_input} lot) kaydedildi!")
                 st.rerun()
 
@@ -606,6 +608,7 @@ elif menu == "📝 Yeni İşlem / Satış":
                     conn.commit()
                     cursor.close()
                     conn.close()
+                    st.cache_data.clear()
                     st.success("Satış tamamlandı!")
                     st.rerun()
 
@@ -618,6 +621,9 @@ elif menu == "🎯 Satış Sonrası Performans (Canlı)":
     if sales_df.empty:
         st.info("Henüz gerçekleştirilmiş satış işlemi bulunmuyor.")
     else:
+        sale_tickers = tuple(sorted(sales_df["ticker"].unique()))
+        market_cache = get_batch_market_data(sale_tickers)
+
         if st.button("🔄 Canlı Fiyatları Güncelle"):
             st.cache_data.clear()
             st.rerun()
@@ -627,7 +633,8 @@ elif menu == "🎯 Satış Sonrası Performans (Canlı)":
                 st.markdown(f"### 📌 {sale['ticker']} Satışı (#{sale['sale_id']}) - {sale['sale_date']}")
                 
                 avg_buy_price = (sale["cost"] / sale["shares"]) if sale["shares"] > 0 else 0.0
-                live_price, _ = get_live_stock_data(sale['ticker'])
+                sym = sale['ticker'].strip().upper()
+                live_price = market_cache.get(sym, {}).get("price", 0.0)
                 current_p = live_price if live_price > 0 else (sale['current_price'] or sale['sale_price'])
 
                 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
@@ -714,6 +721,7 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                         cursor.close()
                         conn.close()
                         st.session_state.edit_lot_id = None
+                        st.cache_data.clear()
                         st.success("Alış kaydı güncellendi!")
                         st.rerun()
 
@@ -742,6 +750,7 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                         conn.commit()
                         cursor.close()
                         conn.close()
+                        st.cache_data.clear()
                         st.success("Alış silindi.")
                         st.rerun()
                 else:
@@ -779,6 +788,7 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                         cursor.close()
                         conn.close()
                         st.session_state.edit_sale_id = None
+                        st.cache_data.clear()
                         st.success("Satış güncellendi!")
                         st.rerun()
 
@@ -810,6 +820,7 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                     conn.commit()
                     cursor.close()
                     conn.close()
+                    st.cache_data.clear()
                     st.success("Satış geri alındı ve lotlar iade edildi.")
                     st.rerun()
 
