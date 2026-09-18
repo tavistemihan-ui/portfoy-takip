@@ -2,6 +2,8 @@ import os
 import io
 import json
 import sqlite3
+import threading
+import requests
 from datetime import datetime
 import streamlit as st
 import pandas as pd
@@ -23,7 +25,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 1. YEREL SQLITE VERİTABANI ---
+# --- 1. VERİTABANI BAĞLANTISI ---
 DB_FILE = "portfolio_data.db"
 
 def get_connection():
@@ -73,7 +75,30 @@ def init_db():
 
 init_db()
 
-# --- 2. DÖVİZ KURLARI & BİÇİMLENDİRME ---
+# --- 2. TELEGRAM OTOMATİK YEDEKLEME MOTORU (ARKA PLANDA ÇALIŞIR) ---
+def _send_telegram_thread(caption_text):
+    try:
+        bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN")
+        chat_id = st.secrets.get("TELEGRAM_CHAT_ID")
+
+        if not bot_token or not chat_id or not os.path.exists(DB_FILE):
+            return
+
+        url = f"https://api.telegram.org/bot{bot_token}/sendDocument"
+        caption = f"📁 Portföy Otomatik Yedeği\nİşlem: {caption_text}\nTarih: {datetime.now().strftime('%d.%m.%Y %H:%M:%S')}"
+
+        with open(DB_FILE, "rb") as f:
+            files = {"document": (f"portfolio_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.db", f)}
+            data = {"chat_id": chat_id, "caption": caption}
+            requests.post(url, data=data, files=files, timeout=10)
+    except Exception:
+        pass
+
+def trigger_auto_backup(action_name="Yeni İşlem"):
+    """Sayfa akışını yavaşlatmadan arka planda Telegram'a dosya atar."""
+    threading.Thread(target=_send_telegram_thread, args=(action_name,), daemon=True).start()
+
+# --- 3. DÖVİZ KURLARI & FORMATLAMA ---
 FIXED_RATES = {"USD_TRY": 34.20, "EUR_TRY": 37.80, "EUR_USD": 1.10}
 
 def format_curr(amount: float, curr: str) -> str:
@@ -103,7 +128,7 @@ def convert_to_base(amount: float, from_curr: str, to_curr: str) -> float:
         return amount_try / FIXED_RATES["EUR_TRY"]
     return amount
 
-# --- 3. VERİTABANI YARDIMCILARI ---
+# --- 4. VERİ ÇEKME YARDIMCILARI ---
 def load_portfolios():
     with get_connection() as conn:
         return pd.read_sql("SELECT * FROM portfolios ORDER BY id", conn)
@@ -129,11 +154,17 @@ if "edit_lot_id" not in st.session_state:
 if "edit_sale_id" not in st.session_state:
     st.session_state.edit_sale_id = None
 
-# --- 4. KENAR ÇUBUĞU ---
+# --- 5. KENAR ÇUBUĞU ---
 with st.sidebar:
     st.title("💼 Portföy Terminali")
-    st.success("⚡ Hızlı Yerel Mod (SQLite)")
-    st.caption("🌐 **Sabit Kurlar:**")
+    st.success("⚡ Hızlı Mod (Yerel SQLite)")
+    
+    if "TELEGRAM_BOT_TOKEN" in st.secrets:
+        st.caption("🤖 Telegram Otomatik Yedek: **Aktif**")
+    else:
+        st.caption("⚠️ Telegram Yedeği: Tanımlanmadı")
+
+    st.caption("🌐 **Kurlar:**")
     st.write(f"USD/TRY: **₺{FIXED_RATES['USD_TRY']}** | EUR/TRY: **₺{FIXED_RATES['EUR_TRY']}**")
     st.divider()
 
@@ -163,14 +194,13 @@ with st.sidebar:
         ]
     )
 
-# --- 5. DASHBOARD ---
+# --- 6. DASHBOARD ---
 if menu == "📊 Dashboard":
     lots_df = load_open_lots()
     sales_df = load_sales()
 
     if is_consolidated:
         st.title(f"🌐 Konsolide Portföy ({base_currency})")
-        
         total_cost_base = 0.0
         total_realized_base = 0.0
         portfolio_rows = []
@@ -230,8 +260,6 @@ if menu == "📊 Dashboard":
 
         if not p_lots.empty:
             p_lots["Toplam Maliyet"] = p_lots["remaining_shares"] * p_lots["buy_price"]
-            
-            # Pasta Grafiği
             st.subheader("🥧 Varlık Dağılımı (%)")
             asset_agg = p_lots.groupby("ticker")["Toplam Maliyet"].sum().reset_index()
             fig_asset = px.pie(asset_agg, names="ticker", values="Toplam Maliyet", hole=0.4, template="plotly_dark")
@@ -239,7 +267,6 @@ if menu == "📊 Dashboard":
 
             st.divider()
             st.subheader("📌 Açık Pozisyonlar Tablosu")
-            
             display_df = p_lots[["ticker", "buy_date", "remaining_shares", "buy_price", "Toplam Maliyet"]].copy()
             display_df.columns = ["Hisse", "Alış Tarihi", "Kalan Lot", "Alış Fiyatı", "Toplam Maliyet"]
             display_df["Alış Fiyatı"] = display_df["Alış Fiyatı"].apply(lambda x: format_curr(x, p_info['currency']))
@@ -248,7 +275,7 @@ if menu == "📊 Dashboard":
         else:
             st.info("Bu portföyde henüz açık hisse bulunmuyor.")
 
-# --- 6. YENİ İŞLEM / SATIŞ ---
+# --- 7. YENİ İŞLEM / SATIŞ ---
 elif menu == "📝 Yeni İşlem / Satış":
     st.title("📝 İşlem Girişi")
     port_dict = {f"{r['name']} ({r['currency']})": (r['id'], r['currency']) for _, r in portfolios_df.iterrows()}
@@ -283,7 +310,8 @@ elif menu == "📝 Yeni İşlem / Satış":
                                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
                                    (target_pid, ticker_input, str(buy_date_input), price_input, shares_input, shares_input, target_pcurr, comm_input))
                     conn.commit()
-                st.success(f"{ticker_input} ({shares_input} lot) başarıyla kaydedildi!")
+                trigger_auto_backup(f"🟢 Alış: {shares_input} Lot {ticker_input} ({price_input} {target_pcurr})")
+                st.success(f"{ticker_input} ({shares_input} lot) kaydedildi ve yedeği Telegram'a gönderildi!")
                 st.rerun()
 
     else:
@@ -350,13 +378,14 @@ elif menu == "📝 Yeni İşlem / Satış":
                                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                                        (target_pid, sel_ticker, datetime.now().strftime("%Y-%m-%d"), total_sold, sale_price, total_cost, sale_comm, realized_pnl, target_pcurr, sale_price, json.dumps(allocations)))
                         conn.commit()
-                    st.success("Satış tamamlandı!")
+                    trigger_auto_backup(f"🔴 Satış: {total_sold} Lot {sel_ticker} (K/Z: {realized_pnl:+,.2f} {target_pcurr})")
+                    st.success("Satış tamamlandı ve yedeği Telegram'a gönderildi!")
                     st.rerun()
 
-# --- 7. SATIŞ SONRASI ANALİZ ---
+# --- 8. SATIŞ SONRASI ANALİZ ---
 elif menu == "🎯 Satış Sonrası Analiz":
     st.title("🎯 Satış Sonrası Karar & Fiyat Analizi")
-    st.caption("Fiyatı doğrudan girerek satış sonrası kâr/zarar durumunuzu anında inceleyin.")
+    st.caption("Fiyatı girerek erken satıp satmadığınızı anında kıyaslayın.")
 
     sales_df = load_sales()
     if sales_df.empty:
@@ -365,7 +394,6 @@ elif menu == "🎯 Satış Sonrası Analiz":
         for idx, sale in sales_df.iterrows():
             with st.container():
                 st.markdown(f"### 📌 {sale['ticker']} Satışı (#{sale['sale_id']}) - {sale['sale_date']}")
-                
                 avg_buy_price = (sale["cost"] / sale["shares"]) if sale["shares"] > 0 else 0.0
                 saved_p = sale["current_price"] if pd.notnull(sale["current_price"]) else sale["sale_price"]
 
@@ -421,7 +449,7 @@ elif menu == "🎯 Satış Sonrası Analiz":
 
                 st.divider()
 
-# --- 8. GEÇMİŞ İŞLEM YÖNETİMİ & DÜZELTME ---
+# --- 9. GEÇMİŞ İŞLEM YÖNETİMİ & DÜZELTME ---
 elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
     st.title("✏️ İşlem Düzeltme, Güncelleme ve Silme")
     tab_buys, tab_sales = st.tabs(["🟢 Alış Lotlarını Düzelt / Sil", "🔴 Satış Kayıtlarını Düzelt / Geri Al"])
@@ -459,7 +487,8 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                                            (new_ticker, str(new_date), new_price, new_shares, rem_shares, new_comm, int(lot_to_edit["lot_id"])))
                             conn.commit()
                         st.session_state.edit_lot_id = None
-                        st.success("Alış kaydı güncellendi!")
+                        trigger_auto_backup(f"✏️ Düzenleme: Lot #{lot_to_edit['lot_id']}")
+                        st.success("Alış kaydı güncellendi ve Telegram yedeği gönderildi!")
                         st.rerun()
 
                     if cancel_edit:
@@ -485,7 +514,8 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                             cursor = conn.cursor()
                             cursor.execute("DELETE FROM lots WHERE lot_id = ?", (int(lot["lot_id"]),))
                             conn.commit()
-                        st.success("Alış silindi.")
+                        trigger_auto_backup(f"🗑️ Silme: Lot #{lot['lot_id']}")
+                        st.success("Alış silindi ve Telegram yedeği gönderildi.")
                         st.rerun()
                 else:
                     c6.caption("Kısmi Satıldı")
@@ -520,6 +550,7 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                                             (str(new_s_date), new_s_price, new_s_comm, new_pnl, int(sale_to_edit["sale_id"])))
                             conn.commit()
                         st.session_state.edit_sale_id = None
+                        trigger_auto_backup(f"✏️ Düzenleme: Satış #{sale_to_edit['sale_id']}")
                         st.success("Satış güncellendi!")
                         st.rerun()
 
@@ -549,22 +580,28 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                                            (item["qty"], item["lot_id"]))
                         cursor.execute("DELETE FROM sales WHERE sale_id = ?", (int(sale["sale_id"]),))
                         conn.commit()
-                    st.success("Satış geri alındı ve lotlar iade edildi.")
+                    trigger_auto_backup(f"↩️ Satış İptali: #{sale['sale_id']}")
+                    st.success("Satış geri alındı ve Telegram yedeği gönderildi.")
                     st.rerun()
 
-# --- 9. YEDEKLEME & PORTFÖY AYARLARI ---
+# --- 10. YEDEKLEME & PORTFÖY AYARLARI ---
 elif menu == "💾 Yedekleme & Portföy Ayarları":
     st.title("💾 Yedekleme & Portföy Yönetimi")
 
-    tab1, tab2 = st.tabs(["💾 Veritabanı Yedeği (.db)", "📁 Portföy Ekle / Sil"])
+    tab1, tab2 = st.tabs(["💾 Yedekleme & Geri Yükleme", "📁 Portföy Ekle / Sil"])
 
     with tab1:
-        st.subheader("💾 Hızlı Yedekleme Paneli")
-        st.caption("İşlem yaptıktan sonra butona basarak yedeğinizi bilgisayarınızda saklayabilirsiniz.")
+        st.subheader("💾 Veritabanı Yedekleme")
         
+        # Test Gönderim Butonu
+        if "TELEGRAM_BOT_TOKEN" in st.secrets:
+            if st.button("🚀 Şimdi Telegram'a Test Yedeği Gönder", type="secondary"):
+                trigger_auto_backup("Manuel Test Yedeği")
+                st.info("Yedek Telegram sohbetinize gönderildi! Telegram'ınızı kontrol edin.")
+
         c_backup1, c_backup2 = st.columns(2)
         with c_backup1:
-            st.markdown("#### 1. Yedeği İndir")
+            st.markdown("#### 1. Manuel İndir")
             if os.path.exists(DB_FILE):
                 with open(DB_FILE, "rb") as f:
                     db_bytes = f.read()
@@ -579,7 +616,7 @@ elif menu == "💾 Yedekleme & Portföy Ayarları":
 
         with c_backup2:
             st.markdown("#### 2. Yedekten Geri Yükle")
-            uploaded_db = st.file_uploader("Yedek Dosyasını Seçin (.db)", type=["db", "sqlite"])
+            uploaded_db = st.file_uploader("Telegram'dan İndirdiğiniz .db Dosyasını Yükleyin", type=["db", "sqlite"])
             if uploaded_db is not None:
                 if st.button("Verileri Geri Yükle", type="primary"):
                     with open(DB_FILE, "wb") as f:
@@ -599,7 +636,8 @@ elif menu == "💾 Yedekleme & Portföy Ayarları":
                         cursor = conn.cursor()
                         cursor.execute("INSERT INTO portfolios (name, currency) VALUES (?, ?)", (p_name.strip(), p_curr))
                         conn.commit()
-                    st.success(f"{p_name} portföyü başarıyla oluşturuldu.")
+                    trigger_auto_backup(f"📁 Yeni Portföy: {p_name}")
+                    st.success(f"{p_name} portföyü oluşturuldu.")
                     st.rerun()
 
         with col_del:
@@ -615,13 +653,14 @@ elif menu == "💾 Yedekleme & Portföy Ayarları":
                         with get_connection() as conn:
                             cursor = conn.cursor()
                             cursor.execute("DELETE FROM lots WHERE portfolio_id = ?", (int(p_row['id']),))
-                            cursor.execute("DELETE FROM sales WHERE portfolio_id = ?", (int(p_row['id']),))
+                            cursor.execute("DELETE FROM sales WHERE portfolio_id = ?", (p_row['id'],))
                             cursor.execute("DELETE FROM portfolios WHERE id = ?", (int(p_row['id']),))
                             conn.commit()
+                        trigger_auto_backup(f"🗑️ Portföy Silindi: {p_row['name']}")
                         st.success(f"{p_row['name']} portföyü silindi.")
                         st.rerun()
 
-# --- 10. EXCEL RAPORU ---
+# --- 11. EXCEL RAPORU ---
 elif menu == "📥 Excel Raporu":
     st.title("📥 Excel Raporu İndir")
     with get_connection() as conn:
