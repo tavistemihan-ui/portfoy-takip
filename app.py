@@ -12,6 +12,7 @@ import yfinance as yf
 # PostgreSQL desteği (Neon DB)
 try:
     import psycopg2
+    from psycopg2 import pool
     PG_AVAILABLE = True
 except ImportError:
     PG_AVAILABLE = False
@@ -36,7 +37,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# --- 1. VERİTABANI BAĞLANTISI (BULUT NEON VEYA YEREL SQLITE) ---
+# --- 1. VERİTABANI BAĞLANTI HAVUZU (HIZLI BAĞLANTI) ---
 DATABASE_URL = None
 if "DATABASE_URL" in st.secrets:
     DATABASE_URL = st.secrets["DATABASE_URL"]
@@ -45,100 +46,119 @@ elif "DATABASE_URL" in os.environ:
 
 IS_POSTGRES = DATABASE_URL is not None and DATABASE_URL.startswith("postgres") and PG_AVAILABLE
 
-def get_connection():
+@st.cache_resource
+def get_db_pool():
     if IS_POSTGRES:
         clean_url = DATABASE_URL.replace("&channel_binding=require", "").replace("?channel_binding=require", "")
-        return psycopg2.connect(clean_url)
-    return sqlite3.connect("portfolio_data.db", check_same_thread=False)
+        return pool.SimpleConnectionPool(1, 10, clean_url)
+    return None
+
+db_pool = get_db_pool()
+
+class DBConnection:
+    def __enter__(self):
+        if IS_POSTGRES and db_pool:
+            self.conn = db_pool.getconn()
+        else:
+            self.conn = sqlite3.connect("portfolio_data.db", check_same_thread=False)
+        return self.conn
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if IS_POSTGRES and db_pool:
+            if exc_type is None:
+                self.conn.commit()
+            else:
+                self.conn.rollback()
+            db_pool.putconn(self.conn)
+        else:
+            if exc_type is None:
+                self.conn.commit()
+            self.conn.close()
 
 def init_db():
-    conn = get_connection()
-    c = conn.cursor()
-    if IS_POSTGRES:
-        c.execute('''CREATE TABLE IF NOT EXISTS portfolios (
-                        id SERIAL PRIMARY KEY,
-                        name TEXT NOT NULL,
-                        currency TEXT NOT NULL)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS lots (
-                        lot_id SERIAL PRIMARY KEY,
-                        portfolio_id INTEGER,
-                        ticker TEXT NOT NULL,
-                        buy_date TEXT NOT NULL,
-                        buy_price DOUBLE PRECISION NOT NULL,
-                        initial_shares DOUBLE PRECISION NOT NULL,
-                        remaining_shares DOUBLE PRECISION NOT NULL,
-                        currency TEXT NOT NULL,
-                        commission DOUBLE PRECISION DEFAULT 0.0)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS sales (
-                        sale_id SERIAL PRIMARY KEY,
-                        portfolio_id INTEGER,
-                        ticker TEXT NOT NULL,
-                        sale_date TEXT NOT NULL,
-                        shares DOUBLE PRECISION NOT NULL,
-                        sale_price DOUBLE PRECISION NOT NULL,
-                        cost DOUBLE PRECISION NOT NULL,
-                        commission DOUBLE PRECISION DEFAULT 0.0,
-                        realized_pnl DOUBLE PRECISION NOT NULL,
-                        currency TEXT NOT NULL,
-                        current_price DOUBLE PRECISION DEFAULT NULL,
-                        allocations_json TEXT)''')
-        conn.commit()
-        c.execute("SELECT COUNT(*) FROM portfolios")
-        if c.fetchone()[0] == 0:
-            c.executemany("INSERT INTO portfolios (name, currency) VALUES (%s, %s)", [
-                ("Amerikan Borsası", "USD"),
-                ("Alman Borsası", "EUR"),
-                ("BIST / Türkiye", "TRY")
-            ])
-            conn.commit()
-    else:
-        c.execute('''CREATE TABLE IF NOT EXISTS portfolios (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name TEXT NOT NULL,
-                        currency TEXT NOT NULL)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS lots (
-                        lot_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        portfolio_id INTEGER,
-                        ticker TEXT NOT NULL,
-                        buy_date TEXT NOT NULL,
-                        buy_price REAL NOT NULL,
-                        initial_shares REAL NOT NULL,
-                        remaining_shares REAL NOT NULL,
-                        currency TEXT NOT NULL,
-                        commission REAL DEFAULT 0.0)''')
-        c.execute('''CREATE TABLE IF NOT EXISTS sales (
-                        sale_id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        portfolio_id INTEGER,
-                        ticker TEXT NOT NULL,
-                        sale_date TEXT NOT NULL,
-                        shares REAL NOT NULL,
-                        sale_price REAL NOT NULL,
-                        cost REAL NOT NULL,
-                        commission REAL DEFAULT 0.0,
-                        realized_pnl REAL NOT NULL,
-                        currency TEXT NOT NULL,
-                        current_price REAL DEFAULT NULL,
-                        allocations_json TEXT)''')
-        c.execute("SELECT COUNT(*) FROM portfolios")
-        if c.fetchone()[0] == 0:
-            c.executemany("INSERT INTO portfolios (name, currency) VALUES (?, ?)", [
-                ("Amerikan Borsası", "USD"),
-                ("Alman Borsası", "EUR"),
-                ("BIST / Türkiye", "TRY")
-            ])
-        conn.commit()
-    c.close()
-    conn.close()
+    with DBConnection() as conn:
+        c = conn.cursor()
+        if IS_POSTGRES:
+            c.execute('''CREATE TABLE IF NOT EXISTS portfolios (
+                            id SERIAL PRIMARY KEY,
+                            name TEXT NOT NULL,
+                            currency TEXT NOT NULL)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS lots (
+                            lot_id SERIAL PRIMARY KEY,
+                            portfolio_id INTEGER,
+                            ticker TEXT NOT NULL,
+                            buy_date TEXT NOT NULL,
+                            buy_price DOUBLE PRECISION NOT NULL,
+                            initial_shares DOUBLE PRECISION NOT NULL,
+                            remaining_shares DOUBLE PRECISION NOT NULL,
+                            currency TEXT NOT NULL,
+                            commission DOUBLE PRECISION DEFAULT 0.0)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS sales (
+                            sale_id SERIAL PRIMARY KEY,
+                            portfolio_id INTEGER,
+                            ticker TEXT NOT NULL,
+                            sale_date TEXT NOT NULL,
+                            shares DOUBLE PRECISION NOT NULL,
+                            sale_price DOUBLE PRECISION NOT NULL,
+                            cost DOUBLE PRECISION NOT NULL,
+                            commission DOUBLE PRECISION DEFAULT 0.0,
+                            realized_pnl DOUBLE PRECISION NOT NULL,
+                            currency TEXT NOT NULL,
+                            current_price DOUBLE PRECISION DEFAULT NULL,
+                            allocations_json TEXT)''')
+            c.execute("SELECT COUNT(*) FROM portfolios")
+            if c.fetchone()[0] == 0:
+                c.executemany("INSERT INTO portfolios (name, currency) VALUES (%s, %s)", [
+                    ("Amerikan Borsası", "USD"),
+                    ("Alman Borsası", "EUR"),
+                    ("BIST / Türkiye", "TRY")
+                ])
+        else:
+            c.execute('''CREATE TABLE IF NOT EXISTS portfolios (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            name TEXT NOT NULL,
+                            currency TEXT NOT NULL)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS lots (
+                            lot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            portfolio_id INTEGER,
+                            ticker TEXT NOT NULL,
+                            buy_date TEXT NOT NULL,
+                            buy_price REAL NOT NULL,
+                            initial_shares REAL NOT NULL,
+                            remaining_shares REAL NOT NULL,
+                            currency TEXT NOT NULL,
+                            commission REAL DEFAULT 0.0)''')
+            c.execute('''CREATE TABLE IF NOT EXISTS sales (
+                            sale_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            portfolio_id INTEGER,
+                            ticker TEXT NOT NULL,
+                            sale_date TEXT NOT NULL,
+                            shares REAL NOT NULL,
+                            sale_price REAL NOT NULL,
+                            cost REAL NOT NULL,
+                            commission REAL DEFAULT 0.0,
+                            realized_pnl REAL NOT NULL,
+                            currency TEXT NOT NULL,
+                            current_price REAL DEFAULT NULL,
+                            allocations_json TEXT)''')
+            c.execute("SELECT COUNT(*) FROM portfolios")
+            if c.fetchone()[0] == 0:
+                c.executemany("INSERT INTO portfolios (name, currency) VALUES (?, ?)", [
+                    ("Amerikan Borsası", "USD"),
+                    ("Alman Borsası", "EUR"),
+                    ("BIST / Türkiye", "TRY")
+                ])
+        c.close()
 
 init_db()
 
-# --- 2. DÖVİZ KURLARI & OPTİMİZE EDİLMİŞ CANLI VERİ ÇEKİMİ ---
+# --- 2. CANLI KURLAR VE HIZLI FİYAT ÇEKİMİ ---
 @st.cache_data(ttl=3600)
 def fetch_live_fx_rates():
     rates = {"USD_TRY": 34.20, "EUR_TRY": 37.80, "EUR_USD": 1.10}
     try:
         url = "https://open.er-api.com/v6/latest/USD"
-        res = requests.get(url, timeout=3).json()
+        res = requests.get(url, timeout=2).json()
         if res and "rates" in res:
             usd_try = float(res["rates"].get("TRY", 34.20))
             usd_eur = float(res["rates"].get("EUR", 0.91))
@@ -151,53 +171,41 @@ def fetch_live_fx_rates():
 
 live_rates = fetch_live_fx_rates()
 
-@st.cache_data(ttl=600)
-def get_batch_market_data(tickers_tuple):
-    """Tüm hisselerin fiyat ve dönemsel verilerini tek seferde topluca çeker (Çok Hızlıdır)."""
+@st.cache_data(ttl=900)
+def get_fast_market_data(tickers_tuple):
+    """Sadece son 5 günü çekerek anında yanıt verir."""
     result = {}
     if not tickers_tuple:
         return result
 
     ticker_str = " ".join([t.strip().upper() for t in tickers_tuple])
     try:
-        # Son 1 yıllık verileri tek seferde indirir
-        data = yf.download(ticker_str, period="1y", interval="1d", group_by="ticker", threads=True, progress=False)
-        
+        data = yf.download(ticker_str, period="5d", interval="1d", group_by="ticker", threads=True, progress=False)
         for sym in tickers_tuple:
             sym_clean = sym.strip().upper()
             sub_df = data[sym_clean] if len(tickers_tuple) > 1 else data
 
             if not sub_df.empty and "Close" in sub_df:
                 closes = sub_df["Close"].dropna()
-                if len(closes) >= 2:
+                if len(closes) >= 1:
                     current_p = round(float(closes.iloc[-1]), 2)
-                    
-                    def get_p_ret(offset):
-                        if len(closes) > offset:
-                            past = float(closes.iloc[-1 - offset])
-                            return round(((current_p - past) / past) * 100, 2)
-                        return 0.0
+                    chg_1d = 0.0
+                    if len(closes) >= 2:
+                        prev = float(closes.iloc[-2])
+                        chg_1d = round(((current_p - prev) / prev) * 100, 2)
 
                     result[sym_clean] = {
                         "price": current_p,
-                        "1D": get_p_ret(1),
-                        "1W": get_p_ret(5),
-                        "1M": get_p_ret(21),
-                        "6M": get_p_ret(126),
-                        "1Y": get_p_ret(250),
-                        "5Y": 0.0,
+                        "1D": chg_1d,
                         "sector": "Genel"
                     }
     except Exception:
         pass
 
-    # Eksik kalan hisseler için basit fallback
     for sym in tickers_tuple:
         sym_clean = sym.strip().upper()
         if sym_clean not in result:
-            result[sym_clean] = {
-                "price": 0.0, "1D": 0.0, "1W": 0.0, "1M": 0.0, "6M": 0.0, "1Y": 0.0, "5Y": 0.0, "sector": "Genel"
-            }
+            result[sym_clean] = {"price": 0.0, "1D": 0.0, "sector": "Genel"}
     return result
 
 def format_curr(amount: float, curr: str) -> str:
@@ -227,30 +235,24 @@ def convert_to_base(amount: float, from_curr: str, to_curr: str) -> float:
         return amount_try / live_rates["EUR_TRY"]
     return amount
 
-# --- 3. VERİ ÇEKME YARDIMCILARI ---
+# --- 3. VERİTABANI OKUMA YARDIMCILARI ---
 def load_portfolios():
-    conn = get_connection()
-    df = pd.read_sql("SELECT * FROM portfolios ORDER BY id", conn)
-    conn.close()
-    return df
+    with DBConnection() as conn:
+        return pd.read_sql("SELECT * FROM portfolios ORDER BY id", conn)
 
 def load_open_lots(portfolio_id=None):
-    conn = get_connection()
-    q = "SELECT * FROM lots WHERE remaining_shares > 0"
-    if portfolio_id:
-        q += f" AND portfolio_id = {portfolio_id}"
-    df = pd.read_sql(q, conn)
-    conn.close()
-    return df
+    with DBConnection() as conn:
+        q = "SELECT * FROM lots WHERE remaining_shares > 0"
+        if portfolio_id:
+            q += f" AND portfolio_id = {portfolio_id}"
+        return pd.read_sql(q, conn)
 
 def load_sales(portfolio_id=None):
-    conn = get_connection()
-    q = "SELECT * FROM sales ORDER BY sale_id DESC"
-    if portfolio_id:
-        q += f" AND portfolio_id = {portfolio_id}"
-    df = pd.read_sql(q, conn)
-    conn.close()
-    return df
+    with DBConnection() as conn:
+        q = "SELECT * FROM sales ORDER BY sale_id DESC"
+        if portfolio_id:
+            q += f" AND portfolio_id = {portfolio_id}"
+        return pd.read_sql(q, conn)
 
 portfolios_df = load_portfolios()
 
@@ -262,9 +264,8 @@ if "edit_sale_id" not in st.session_state:
 # --- 4. KENAR ÇUBUĞU ---
 with st.sidebar:
     st.title("💼 Portföy Terminali")
-    
     if IS_POSTGRES:
-        st.success("🟢 Bulut Veritabanı Bağlı (Neon)")
+        st.success("🟢 Bulut Veritabanı Bağlı (Hızlı)")
     else:
         st.warning("🟠 Yerel SQLite Veritabanı")
 
@@ -291,7 +292,7 @@ with st.sidebar:
         [
             "📊 Dashboard (Canlı Fiyatlı)",
             "📝 Yeni İşlem / Satış",
-            "🎯 Satış Sonrası Performans (Canlı)",
+            "🎯 Satış Sonrası Performans",
             "✏️ Geçmiş İşlem Yönetimi & Düzeltme",
             "⚙️ Portföy Ayarları",
             "📥 Excel Raporu"
@@ -303,9 +304,8 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
     lots_df = load_open_lots()
     sales_df = load_sales()
 
-    # Açık olan tüm hisseleri topluca tek ağ isteğiyle çek
     all_open_tickers = tuple(sorted(lots_df["ticker"].unique())) if not lots_df.empty else ()
-    market_cache = get_batch_market_data(all_open_tickers)
+    market_cache = get_fast_market_data(all_open_tickers)
 
     if is_consolidated:
         st.title(f"🌐 Konsolide Portföy ({base_currency})")
@@ -457,45 +457,6 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
                 return html
 
             st.write(build_custom_html_table(df_table), unsafe_allow_html=True)
-
-            st.divider()
-            st.subheader("📊 Açık Hisselerin Dönemsel Getiri Performansı")
-
-            period_rows = []
-            for sym in sorted(df_lots_full["Hisse"].unique()):
-                m_info = market_cache.get(sym, {})
-                period_rows.append({
-                    "Hisse": sym,
-                    "Şimdiki Fiyat": format_curr(m_info.get("price", 0.0), p_info['currency']),
-                    "1 Günlük": m_info.get("1D", 0.0),
-                    "1 Haftalık": m_info.get("1W", 0.0),
-                    "1 Aylık": m_info.get("1M", 0.0),
-                    "6 Aylık": m_info.get("6M", 0.0),
-                    "1 Yıllık": m_info.get("1Y", 0.0)
-                })
-
-            df_perf = pd.DataFrame(period_rows)
-
-            def build_perf_html_table(df):
-                html = """<table style="width:100%; border-collapse: collapse; text-align:left;"><thead><tr style="border-bottom: 2px solid #30363d; background-color:#161b22;">"""
-                for col in df.columns:
-                    html += f"""<th style="padding:10px; font-weight:600; color:#c9d1d9;">{col}</th>"""
-                html += "</tr></thead><tbody>"
-
-                for _, row in df.iterrows():
-                    html += "<tr style='border-bottom: 1px solid #21262d;'>"
-                    for col in df.columns:
-                        val = row[col]
-                        if col in ["1 Günlük", "1 Haftalık", "1 Aylık", "6 Aylık", "1 Yıllık"]:
-                            color = "#2ea043" if val >= 0 else "#f85149"
-                            html += f"<td style='padding:10px; font-weight:bold; color:{color};'>%{val:+.2f}</td>"
-                        else:
-                            html += f"<td style='padding:10px; color:#e6edf3;'>{val}</td>"
-                    html += "</tr>"
-                html += "</tbody></table>"
-                return html
-
-            st.write(build_perf_html_table(df_perf), unsafe_allow_html=True)
         else:
             st.info("Bu portföyde henüz açık hisse bulunmuyor.")
 
@@ -527,16 +488,14 @@ elif menu == "📝 Yeni İşlem / Satış":
 
         if st.button("Alışı Kaydet", type="primary"):
             if ticker_input:
-                conn = get_connection()
-                cursor = conn.cursor()
                 p = "%s" if IS_POSTGRES else "?"
-                cursor.execute(f'''INSERT INTO lots 
-                                  (portfolio_id, ticker, buy_date, buy_price, initial_shares, remaining_shares, currency, commission) 
-                                  VALUES ({p}, {p}, {p}, {p}, {p}, {p}, {p}, {p})''',
-                               (target_pid, ticker_input, str(buy_date_input), price_input, shares_input, shares_input, target_pcurr, comm_input))
-                conn.commit()
-                cursor.close()
-                conn.close()
+                with DBConnection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(f'''INSERT INTO lots 
+                                      (portfolio_id, ticker, buy_date, buy_price, initial_shares, remaining_shares, currency, commission) 
+                                      VALUES ({p}, {p}, {p}, {p}, {p}, {p}, {p}, {p})''',
+                                   (target_pid, ticker_input, str(buy_date_input), price_input, shares_input, shares_input, target_pcurr, comm_input))
+                    cursor.close()
                 st.cache_data.clear()
                 st.success(f"{ticker_input} ({shares_input} lot) kaydedildi!")
                 st.rerun()
@@ -595,36 +554,32 @@ elif menu == "📝 Yeni İşlem / Satış":
                 m4.metric("Net Kâr/Zarar", format_curr(realized_pnl, target_pcurr), delta=f"%{ret_pct:+.2f}")
 
                 if st.button("Satışı Onayla ve Tamamla", type="primary"):
-                    conn = get_connection()
-                    cursor = conn.cursor()
                     p = "%s" if IS_POSTGRES else "?"
-                    for alloc in allocations:
-                        cursor.execute(f"UPDATE lots SET remaining_shares = remaining_shares - {p} WHERE lot_id = {p}",
-                                       (alloc["qty"], alloc["lot_id"]))
-                    cursor.execute(f'''INSERT INTO sales 
-                                      (portfolio_id, ticker, sale_date, shares, sale_price, cost, commission, realized_pnl, currency, current_price, allocations_json) 
-                                      VALUES ({p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p})''',
-                                   (target_pid, sel_ticker, datetime.now().strftime("%Y-%m-%d"), total_sold, sale_price, total_cost, sale_comm, realized_pnl, target_pcurr, sale_price, json.dumps(allocations)))
-                    conn.commit()
-                    cursor.close()
-                    conn.close()
+                    with DBConnection() as conn:
+                        cursor = conn.cursor()
+                        for alloc in allocations:
+                            cursor.execute(f"UPDATE lots SET remaining_shares = remaining_shares - {p} WHERE lot_id = {p}",
+                                           (alloc["qty"], alloc["lot_id"]))
+                        cursor.execute(f'''INSERT INTO sales 
+                                          (portfolio_id, ticker, sale_date, shares, sale_price, cost, commission, realized_pnl, currency, current_price, allocations_json) 
+                                          VALUES ({p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p}, {p})''',
+                                       (target_pid, sel_ticker, datetime.now().strftime("%Y-%m-%d"), total_sold, sale_price, total_cost, sale_comm, realized_pnl, target_pcurr, sale_price, json.dumps(allocations)))
+                        cursor.close()
                     st.cache_data.clear()
                     st.success("Satış tamamlandı!")
                     st.rerun()
 
-# --- 7. SATIŞ SONRASI PERFORMANS (CANLI) ---
-elif menu == "🎯 Satış Sonrası Performans (Canlı)":
+# --- 7. SATIŞ SONRASI PERFORMANS ---
+elif menu == "🎯 Satış Sonrası Performans":
     st.title("🎯 Satış Sonrası Canlı Fiyat & Karar Analizi")
-    st.caption("Alış, satış ve güncel piyasa fiyatı arasındaki tüm farklar canlı karşılaştırılır.")
-
     sales_df = load_sales()
     if sales_df.empty:
         st.info("Henüz gerçekleştirilmiş satış işlemi bulunmuyor.")
     else:
         sale_tickers = tuple(sorted(sales_df["ticker"].unique()))
-        market_cache = get_batch_market_data(sale_tickers)
+        market_cache = get_fast_market_data(sale_tickers)
 
-        if st.button("🔄 Canlı Fiyatları Güncelle"):
+        if st.button("🔄 Fiyatları Canlı Yenile"):
             st.cache_data.clear()
             st.rerun()
 
@@ -684,9 +639,8 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
     p = "%s" if IS_POSTGRES else "?"
 
     with tab_buys:
-        conn = get_connection()
-        all_lots = pd.read_sql("SELECT * FROM lots ORDER BY lot_id", conn)
-        conn.close()
+        with DBConnection() as conn:
+            all_lots = pd.read_sql("SELECT * FROM lots ORDER BY lot_id", conn)
 
         if all_lots.empty:
             st.info("Kayıtlı alış bulunmuyor.")
@@ -711,15 +665,13 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                     cancel_edit = f_b2.form_submit_button("İptal")
 
                     if save_edit:
-                        conn = get_connection()
-                        cursor = conn.cursor()
                         rem_shares = new_shares if not is_sold else lot_to_edit["remaining_shares"]
-                        cursor.execute(f'''UPDATE lots SET ticker = {p}, buy_date = {p}, buy_price = {p}, initial_shares = {p}, remaining_shares = {p}, commission = {p} 
-                                          WHERE lot_id = {p}''',
-                                       (new_ticker, str(new_date), new_price, new_shares, rem_shares, new_comm, int(lot_to_edit["lot_id"])))
-                        conn.commit()
-                        cursor.close()
-                        conn.close()
+                        with DBConnection() as conn:
+                            cursor = conn.cursor()
+                            cursor.execute(f'''UPDATE lots SET ticker = {p}, buy_date = {p}, buy_price = {p}, initial_shares = {p}, remaining_shares = {p}, commission = {p} 
+                                              WHERE lot_id = {p}''',
+                                           (new_ticker, str(new_date), new_price, new_shares, rem_shares, new_comm, int(lot_to_edit["lot_id"])))
+                            cursor.close()
                         st.session_state.edit_lot_id = None
                         st.cache_data.clear()
                         st.success("Alış kaydı güncellendi!")
@@ -744,12 +696,10 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
 
                 if lot["remaining_shares"] == lot["initial_shares"]:
                     if c6.button("🗑️ Sil", key=f"del_lot_{lot['lot_id']}"):
-                        conn = get_connection()
-                        cursor = conn.cursor()
-                        cursor.execute(f"DELETE FROM lots WHERE lot_id = {p}", (int(lot["lot_id"]),))
-                        conn.commit()
-                        cursor.close()
-                        conn.close()
+                        with DBConnection() as conn:
+                            cursor = conn.cursor()
+                            cursor.execute(f"DELETE FROM lots WHERE lot_id = {p}", (int(lot["lot_id"]),))
+                            cursor.close()
                         st.cache_data.clear()
                         st.success("Alış silindi.")
                         st.rerun()
@@ -779,14 +729,12 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                         new_proceeds = sale_to_edit["shares"] * new_s_price
                         new_pnl = (new_proceeds - sale_to_edit["cost"]) - new_s_comm
 
-                        conn = get_connection()
-                        cursor = conn.cursor()
-                        cursor.execute(f'''UPDATE sales SET sale_date = {p}, sale_price = {p}, commission = {p}, realized_pnl = {p} 
-                                           WHERE sale_id = {p}''',
-                                        (str(new_s_date), new_s_price, new_s_comm, new_pnl, int(sale_to_edit["sale_id"])))
-                        conn.commit()
-                        cursor.close()
-                        conn.close()
+                        with DBConnection() as conn:
+                            cursor = conn.cursor()
+                            cursor.execute(f'''UPDATE sales SET sale_date = {p}, sale_price = {p}, commission = {p}, realized_pnl = {p} 
+                                               WHERE sale_id = {p}''',
+                                            (str(new_s_date), new_s_price, new_s_comm, new_pnl, int(sale_to_edit["sale_id"])))
+                            cursor.close()
                         st.session_state.edit_sale_id = None
                         st.cache_data.clear()
                         st.success("Satış güncellendi!")
@@ -811,15 +759,13 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
 
                 if c6.button("🗑️ Geri Al", key=f"del_sale_{sale['sale_id']}"):
                     allocs = json.loads(sale["allocations_json"])
-                    conn = get_connection()
-                    cursor = conn.cursor()
-                    for item in allocs:
-                        cursor.execute(f"UPDATE lots SET remaining_shares = remaining_shares + {p} WHERE lot_id = {p}",
-                                       (item["qty"], item["lot_id"]))
-                    cursor.execute(f"DELETE FROM sales WHERE sale_id = {p}", (int(sale["sale_id"]),))
-                    conn.commit()
-                    cursor.close()
-                    conn.close()
+                    with DBConnection() as conn:
+                        cursor = conn.cursor()
+                        for item in allocs:
+                            cursor.execute(f"UPDATE lots SET remaining_shares = remaining_shares + {p} WHERE lot_id = {p}",
+                                           (item["qty"], item["lot_id"]))
+                        cursor.execute(f"DELETE FROM sales WHERE sale_id = {p}", (int(sale["sale_id"]),))
+                        cursor.close()
                     st.cache_data.clear()
                     st.success("Satış geri alındı ve lotlar iade edildi.")
                     st.rerun()
@@ -827,10 +773,6 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
 # --- 9. PORTFÖY AYARLARI ---
 elif menu == "⚙️ Portföy Ayarları":
     st.title("⚙️ Portföy Tanımları ve Yönetimi")
-    
-    if IS_POSTGRES:
-        st.success("☁️ Verileriniz güvenli bulut veritabanında (Neon PostgreSQL) tutulmaktadır. Yedek almaya gerek yoktur.")
-    
     p = "%s" if IS_POSTGRES else "?"
 
     col_add, col_del = st.columns(2)
@@ -840,12 +782,10 @@ elif menu == "⚙️ Portföy Ayarları":
         p_curr = st.selectbox("Para Birimi", ["USD", "EUR", "TRY"])
         if st.button("Portföyü Kaydet", type="primary"):
             if p_name.strip():
-                conn = get_connection()
-                cursor = conn.cursor()
-                cursor.execute(f"INSERT INTO portfolios (name, currency) VALUES ({p}, {p})", (p_name.strip(), p_curr))
-                conn.commit()
-                cursor.close()
-                conn.close()
+                with DBConnection() as conn:
+                    cursor = conn.cursor()
+                    cursor.execute(f"INSERT INTO portfolios (name, currency) VALUES ({p}, {p})", (p_name.strip(), p_curr))
+                    cursor.close()
                 st.success(f"{p_name} portföyü başarıyla oluşturuldu.")
                 st.rerun()
 
@@ -859,24 +799,21 @@ elif menu == "⚙️ Portföy Ayarları":
                 p_c1.write(f"📁 **{p_row['name']}** ({p_row['currency']})")
                 
                 if p_c2.button("Sil", key=f"del_port_{p_row['id']}"):
-                    conn = get_connection()
-                    cursor = conn.cursor()
-                    cursor.execute(f"DELETE FROM lots WHERE portfolio_id = {p}", (int(p_row['id']),))
-                    cursor.execute(f"DELETE FROM sales WHERE portfolio_id = {p}", (p_row['id'],))
-                    cursor.execute(f"DELETE FROM portfolios WHERE id = {p}", (int(p_row['id']),))
-                    conn.commit()
-                    cursor.close()
-                    conn.close()
+                    with DBConnection() as conn:
+                        cursor = conn.cursor()
+                        cursor.execute(f"DELETE FROM lots WHERE portfolio_id = {p}", (int(p_row['id']),))
+                        cursor.execute(f"DELETE FROM sales WHERE portfolio_id = {p}", (p_row['id'],))
+                        cursor.execute(f"DELETE FROM portfolios WHERE id = {p}", (int(p_row['id']),))
+                        cursor.close()
                     st.success(f"{p_row['name']} portföyü silindi.")
                     st.rerun()
 
 # --- 10. EXCEL RAPORU ---
 elif menu == "📥 Excel Raporu":
     st.title("📥 Excel Raporu İndir")
-    conn = get_connection()
-    df_lots = pd.read_sql("SELECT * FROM lots", conn)
-    df_sales = pd.read_sql("SELECT * FROM sales", conn)
-    conn.close()
+    with DBConnection() as conn:
+        df_lots = pd.read_sql("SELECT * FROM lots", conn)
+        df_sales = pd.read_sql("SELECT * FROM sales", conn)
     
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
