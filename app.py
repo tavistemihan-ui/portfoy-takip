@@ -484,7 +484,7 @@ if menu == "📊 Dashboard":
         else:
             st.info("Bu portföyde henüz açık hisse bulunmuyor.")
 
-# --- 7. YENİ İŞLEM / SATIŞ (TÜMÜNÜ SAT BUTONU DAHİL) ---
+# --- 7. YENİ İŞLEM / SATIŞ (TÜMÜ BUTONU & SATIŞ TARİHİ GİRİŞİ DAHİL) ---
 elif menu == "📝 Yeni İşlem / Satış":
     st.title("📝 İşlem Girişi")
     port_dict = {f"{r['name']} ({r['currency']})": (r['id'], r['currency']) for _, r in portfolios_df.iterrows()}
@@ -534,14 +534,19 @@ elif menu == "📝 Yeni İşlem / Satış":
             available_tickers = sorted(open_lots_p["ticker"].unique())
             sel_ticker = st.selectbox("Satılacak Hisseyi Seçin", available_tickers)
             
-            cs1, cs2 = st.columns(2)
+            cs1, cs2, cs3 = st.columns(3)
             with cs1:
-                sale_price = st.number_input(f"Satış Fiyatı ({target_pcurr})", min_value=0.01, value=90.0, step=1.0)
+                sale_date_input = st.date_input("Satış Tarihi", datetime.now())
             with cs2:
+                sale_price = st.number_input(f"Satış Fiyatı ({target_pcurr})", min_value=0.01, value=90.0, step=1.0)
+            with cs3:
                 sale_comm = st.number_input(f"Satış Komisyonu ({target_pcurr})", min_value=0.0, value=default_comm, step=0.1)
 
             ticker_lots = open_lots_p[open_lots_p["ticker"] == sel_ticker]
             st.markdown("#### 🎯 Hangi Alıştan Satış Yapmak İstiyorsunuz?")
+
+            def set_full_lot(lot_key, max_val):
+                st.session_state[lot_key] = max_val
 
             allocations = []
             total_sold = 0.0
@@ -560,6 +565,17 @@ elif menu == "📝 Yeni İşlem / Satış":
                 c2.write(f"Alış: **{format_curr(lot['buy_price'], lot['currency'])}**")
                 c3.write(f"Kalan: **{rem_shares:.2f} lot**")
                 
+                # Streamlit güvenli callback fonksiyonu ile "Tümü" butonu
+                with c5:
+                    st.write("")
+                    st.button(
+                        "⚡ Tümü", 
+                        key=f"btn_all_{lot_id}", 
+                        help=f"{rem_shares:.2f} lotun tamamını seç",
+                        on_click=set_full_lot,
+                        args=(key_name, rem_shares)
+                    )
+
                 qty = c4.number_input(
                     f"Sat (Lot #{lot_id})",
                     min_value=0.0,
@@ -568,13 +584,6 @@ elif menu == "📝 Yeni İşlem / Satış":
                     format="%.2f",
                     key=key_name
                 )
-
-                # "Tümü" Hızlı Doldurma Butonu
-                with c5:
-                    st.write("") # Boşluk hizalama
-                    if st.button(f"⚡ Tümü", key=f"btn_all_{lot_id}", help=f"{rem_shares:.2f} lotun tamamını seç"):
-                        st.session_state[key_name] = rem_shares
-                        st.rerun()
 
                 if qty > 0:
                     allocations.append({"lot_id": lot_id, "qty": qty, "buy_price": lot["buy_price"]})
@@ -602,10 +611,9 @@ elif menu == "📝 Yeni İşlem / Satış":
                         cursor.execute('''INSERT INTO sales 
                                           (portfolio_id, ticker, sale_date, shares, sale_price, cost, commission, realized_pnl, currency, current_price, allocations_json) 
                                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
-                                       (target_pid, sel_ticker, datetime.now().strftime("%Y-%m-%d"), total_sold, sale_price, total_cost, sale_comm, realized_pnl, target_pcurr, sale_price, json.dumps(allocations)))
+                                       (target_pid, sel_ticker, str(sale_date_input), total_sold, sale_price, total_cost, sale_comm, realized_pnl, target_pcurr, sale_price, json.dumps(allocations)))
                         conn.commit()
                     
-                    # Session state kutucuklarını temizle
                     for alloc in allocations:
                         st.session_state[f"sell_{alloc['lot_id']}"] = 0.0
 
