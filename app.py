@@ -141,7 +141,6 @@ def get_live_price(ticker_symbol: str) -> float:
 
 @st.cache_data(ttl=86400)
 def get_stock_sector(ticker_symbol: str) -> str:
-    """Hissenin sektörünü çeker ve 24 saat önbellekte tutar."""
     sym = ticker_symbol.strip().upper()
     try:
         t = yf.Ticker(sym)
@@ -320,7 +319,6 @@ if menu == "📊 Dashboard":
 
         st.divider()
 
-        # KONSOLİDE PASTA GRAFİKLERİ (Portföy & Sektörel Dağılım)
         if consolidated_position_rows:
             df_cons_pos = pd.DataFrame(consolidated_position_rows)
             col1, col2 = st.columns(2)
@@ -338,7 +336,6 @@ if menu == "📊 Dashboard":
             st.divider()
             st.subheader("📌 Konsolide Pozisyon Tablosu")
             
-            # HTML Tablosu
             html_cons = f"""<table style="width:100%; border-collapse: collapse; text-align:left;">
             <thead>
                 <tr style="border-bottom: 2px solid #30363d; background-color:#161b22;">
@@ -429,7 +426,6 @@ if menu == "📊 Dashboard":
         if lot_table_data:
             df_full = pd.DataFrame(lot_table_data)
 
-            # 1. VARLIK DAĞILIMI & 2. SEKTÖREL DAĞILIM PASTA GRAFİKLERİ
             g1, g2 = st.columns(2)
             with g1:
                 st.subheader("🥧 Portföy Varlık Dağılımı (%)")
@@ -446,7 +442,6 @@ if menu == "📊 Dashboard":
             st.divider()
             st.subheader("📌 Açık Pozisyonlar Tablosu (Canlı K/Z ve Sektör)")
 
-            # Renkli HTML Tablosu (Sektör sütunu ve 2 basamaklı Kalan Lot dahil)
             def build_custom_html_table(df, curr):
                 html = """<table style="width:100%; border-collapse: collapse; text-align:left;">
                 <thead>
@@ -489,7 +484,7 @@ if menu == "📊 Dashboard":
         else:
             st.info("Bu portföyde henüz açık hisse bulunmuyor.")
 
-# --- 7. YENİ İŞLEM / SATIŞ ---
+# --- 7. YENİ İŞLEM / SATIŞ (TÜMÜNÜ SAT BUTONU DAHİL) ---
 elif menu == "📝 Yeni İşlem / Satış":
     st.title("📝 İşlem Girişi")
     port_dict = {f"{r['name']} ({r['currency']})": (r['id'], r['currency']) for _, r in portfolios_df.iterrows()}
@@ -553,21 +548,36 @@ elif menu == "📝 Yeni İşlem / Satış":
             total_cost = 0.0
 
             for _, lot in ticker_lots.iterrows():
-                c1, c2, c3, c4 = st.columns([2, 2, 2, 3])
+                lot_id = int(lot["lot_id"])
+                rem_shares = float(lot["remaining_shares"])
+                key_name = f"sell_{lot_id}"
+
+                if key_name not in st.session_state:
+                    st.session_state[key_name] = 0.0
+
+                c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 3, 1.5])
                 c1.write(f"📅 **{lot['buy_date']}**")
                 c2.write(f"Alış: **{format_curr(lot['buy_price'], lot['currency'])}**")
-                c3.write(f"Kalan: **{lot['remaining_shares']:.2f} lot**")
+                c3.write(f"Kalan: **{rem_shares:.2f} lot**")
+                
                 qty = c4.number_input(
-                    f"Sat (Lot #{lot['lot_id']})",
+                    f"Sat (Lot #{lot_id})",
                     min_value=0.0,
-                    max_value=float(lot["remaining_shares"]),
-                    value=0.0,
+                    max_value=rem_shares,
                     step=0.01,
                     format="%.2f",
-                    key=f"sell_{lot['lot_id']}"
+                    key=key_name
                 )
+
+                # "Tümü" Hızlı Doldurma Butonu
+                with c5:
+                    st.write("") # Boşluk hizalama
+                    if st.button(f"⚡ Tümü", key=f"btn_all_{lot_id}", help=f"{rem_shares:.2f} lotun tamamını seç"):
+                        st.session_state[key_name] = rem_shares
+                        st.rerun()
+
                 if qty > 0:
-                    allocations.append({"lot_id": int(lot["lot_id"]), "qty": qty, "buy_price": lot["buy_price"]})
+                    allocations.append({"lot_id": lot_id, "qty": qty, "buy_price": lot["buy_price"]})
                     total_sold += qty
                     total_cost += (qty * lot["buy_price"])
 
@@ -594,6 +604,11 @@ elif menu == "📝 Yeni İşlem / Satış":
                                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                                        (target_pid, sel_ticker, datetime.now().strftime("%Y-%m-%d"), total_sold, sale_price, total_cost, sale_comm, realized_pnl, target_pcurr, sale_price, json.dumps(allocations)))
                         conn.commit()
+                    
+                    # Session state kutucuklarını temizle
+                    for alloc in allocations:
+                        st.session_state[f"sell_{alloc['lot_id']}"] = 0.0
+
                     st.cache_data.clear()
                     trigger_auto_backup(f"🔴 Satış: {total_sold:.2f} Lot {sel_ticker} (K/Z: {realized_pnl:+,.2f} {target_pcurr})")
                     st.success("Satış tamamlandı ve yedeği Telegram'a gönderildi!")
