@@ -30,6 +30,7 @@ if not check_password():
     st.stop()  # Şifre doğru girilene kadar uygulamanın geri kalanını çalıştırmaz
 # ----------------------------
 
+
 st.set_page_config(
     page_title="Portföy Terminal Pro",
     page_icon="💼",
@@ -42,7 +43,6 @@ st.markdown("""
 <style>
     .metric-card { background-color: #161b22; border: 1px solid #30363d; border-radius: 8px; padding: 16px; }
     .stButton>button { border-radius: 6px; }
-    /* Tablo başlıklarının alt satıra geçmesini sağlar */
     th {
         white-space: pre-wrap !important;
         vertical-align: middle !important;
@@ -120,7 +120,7 @@ def check_password():
 if not check_password():
     st.stop()
 
-# --- 3. DÖVİZ KURLARI & PİYASA VERİLERİ (FİYAT, SEKTÖR, DÖNEMSEL GETİRİ) ---
+# --- 3. DÖVİZ KURLARI & PİYASA VERİLERİ ---
 @st.cache_data(ttl=1800)
 def fetch_live_fx_rates():
     rates = {"USD_TRY": 34.20, "EUR_TRY": 37.80, "EUR_USD": 1.10}
@@ -141,7 +141,6 @@ live_rates = fetch_live_fx_rates()
 
 @st.cache_data(ttl=300)
 def get_live_stock_data(ticker: str):
-    """Yahoo Finance üzerinden anlık fiyat ve sektör bilgisini çeker."""
     try:
         t = yf.Ticker(ticker.strip().upper())
         hist = t.history(period="1d")
@@ -158,7 +157,6 @@ def get_live_stock_data(ticker: str):
 
 @st.cache_data(ttl=600)
 def get_stock_multi_period_performance(ticker: str):
-    """Hissenin 1G, 1H, 1A, 6A, 1Y ve 5Y getirilerini hesaplar."""
     perf = {"current_price": 0.0, "1D": 0.0, "1W": 0.0, "1M": 0.0, "6M": 0.0, "1Y": 0.0, "5Y": 0.0}
     try:
         t = yf.Ticker(ticker.strip().upper())
@@ -176,13 +174,12 @@ def get_stock_multi_period_performance(ticker: str):
                     return ((current_close - past_close) / past_close) * 100
             return 0.0
 
-        perf["1D"] = calc_ret(1)    # 1 gün önce
-        perf["1W"] = calc_ret(5)    # ~1 hafta (~5 borsa günü)
-        perf["1M"] = calc_ret(21)   # ~1 ay (~21 borsa günü)
-        perf["6M"] = calc_ret(126)  # ~6 ay (~126 borsa günü)
-        perf["1Y"] = calc_ret(252)  # ~1 yıl (~252 borsa günü)
+        perf["1D"] = calc_ret(1)
+        perf["1W"] = calc_ret(5)
+        perf["1M"] = calc_ret(21)
+        perf["6M"] = calc_ret(126)
+        perf["1Y"] = calc_ret(252)
         
-        # 5 Yıl (varsa en başı)
         first_close = float(hist["Close"].iloc[0])
         if first_close > 0 and len(hist) >= 500:
             perf["5Y"] = ((current_close - first_close) / first_close) * 100
@@ -271,7 +268,7 @@ with st.sidebar:
             "📝 Yeni İşlem / Satış",
             "🎯 Satış Sonrası Performans (Canlı)",
             "✏️ Geçmiş İşlem Yönetimi & Düzeltme",
-            "⚙️ Portföy Ayarları",
+            "⚙️ Portföy & Yedekleme Ayarları",
             "📥 Excel Raporu"
         ]
     )
@@ -386,7 +383,6 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
 
         st.divider()
 
-        # PASTA GRAFİKLERİ
         if lot_details:
             df_lots_full = pd.DataFrame(lot_details)
             g1, g2 = st.columns(2)
@@ -403,13 +399,10 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
                 st.plotly_chart(fig_sector, use_container_width=True)
 
             st.divider()
-
-            # 1. TABLO: AÇIK POZİSYONLAR VE CANLI K/Z
             st.subheader("📌 Açık Pozisyonlar ve Canlı K/Z Durumu")
 
             df_table = df_lots_full.drop(columns=["Piyasa Değeri Ham"]).copy()
 
-            # Renklendirme ve alt satır formatı için HTML oluşturma
             def build_custom_html_table(df):
                 html = """<table style="width:100%; border-collapse: collapse; text-align:left;"><thead><tr style="border-bottom: 2px solid #30363d; background-color:#161b22;">"""
                 for col in df.columns:
@@ -424,7 +417,6 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
                             color = "#2ea043" if val >= 0 else "#f85149"
                             html += f"<td style='padding:10px; font-weight:bold; color:{color};'>%{val:+.2f}</td>"
                         elif col == "Anlık K/Z<br>Tutarı":
-                            # Eksi işaretine göre renklendir
                             color = "#f85149" if "-" in str(val) else "#2ea043"
                             html += f"<td style='padding:10px; font-weight:600; color:{color};'>{val}</td>"
                         else:
@@ -436,10 +428,7 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
             st.write(build_custom_html_table(df_table), unsafe_allow_html=True)
 
             st.divider()
-
-            # 2. TABLO: DÖNEMSEL GETİRİ ANALİZİ (1G, 1H, 1A, 6A, 1Y, 5Y)
             st.subheader("📊 Açık Hisselerin Dönemsel Getiri Performansı (Canlı Piyasa)")
-            st.caption("Açık pozisyonlarınızdaki hisselerin geçmiş dönemlerdeki piyasa fiyat değişimleri.")
 
             unique_tickers = sorted(df_lots_full["Hisse"].unique())
             period_rows = []
@@ -479,7 +468,6 @@ if menu == "📊 Dashboard (Canlı Fiyatlı)":
                 return html
 
             st.write(build_perf_html_table(df_perf), unsafe_allow_html=True)
-
         else:
             st.info("Bu portföyde henüz açık hisse bulunmuyor.")
 
@@ -779,41 +767,76 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                     st.success("Satış geri alındı ve lotlar iade edildi.")
                     st.rerun()
 
-# --- 10. PORTFÖY AYARLARI ---
-elif menu == "⚙️ Portföy Ayarları":
-    st.title("⚙️ Portföy Tanımları ve Yönetimi")
+# --- 10. PORTFÖY & YEDEKLEME AYARLARI (YENİ EKLENEN BÖLÜM) ---
+elif menu == "⚙️ Portföy & Yedekleme Ayarları":
+    st.title("⚙️ Portföy ve Veri Yedekleme Yönetimi")
     
-    col_add, col_del = st.columns(2)
-    with col_add:
-        st.subheader("➕ Yeni Portföy Oluştur")
-        p_name = st.text_input("Portföy Adı", placeholder="Örn: Temettü Portföyü")
-        p_curr = st.selectbox("Para Birimi", ["USD", "EUR", "TRY"])
-        if st.button("Portföyü Kaydet", type="primary"):
-            if p_name.strip():
-                with get_connection() as conn:
-                    conn.cursor().execute("INSERT INTO portfolios (name, currency) VALUES (?, ?)", (p_name.strip(), p_curr))
-                    conn.commit()
-                st.success(f"{p_name} portföyü başarıyla oluşturuldu.")
-                st.rerun()
+    st.info("💡 **Önemli Bilgi:** Streamlit Cloud uyku moduna geçtiğinde sunucudaki geçici verileri sıfırlar. İşlemlerinizin kalıcı olarak korunması için aşağıdaki **Veritabanı Yedeğini İndir** butonunu kullanarak dosyanızı bilgisayarınızda saklayabilir, site uyandığında **Yedekten Geri Yükle** kısmından saniyeler içinde geri yükleyebilirsiniz.")
 
-    with col_del:
-        st.subheader("🗑️ Mevcut Portföyleri Sil")
-        if portfolios_df.empty:
-            st.info("Kayıtlı portföy bulunmuyor.")
-        else:
-            for _, p in portfolios_df.iterrows():
-                p_c1, p_c2 = st.columns([3, 1])
-                p_c1.write(f"📁 **{p['name']}** ({p['currency']})")
-                
-                if p_c2.button("Sil", key=f"del_port_{p['id']}"):
-                    with get_connection() as conn:
-                        cursor = conn.cursor()
-                        cursor.execute("DELETE FROM lots WHERE portfolio_id = ?", (p['id'],))
-                        cursor.execute("DELETE FROM sales WHERE portfolio_id = ?", (p['id'],))
-                        cursor.execute("DELETE FROM portfolios WHERE id = ?", (p['id'],))
-                        conn.commit()
-                    st.success(f"{p['name']} portföyü silindi.")
+    tab1, tab2 = st.tabs(["💾 Veritabanı Yedeği Al / Geri Yükle", "📁 Portföy Yönetimi"])
+
+    with tab1:
+        st.subheader("💾 Veritabanı Yedekleme İşlemleri")
+        
+        c_backup1, c_backup2 = st.columns(2)
+        with c_backup1:
+            st.markdown("#### 1. Yedeği Bilgisayara İndir")
+            st.caption("Tüm portföylerinizi, açık lotlarınızı ve satış geçmişinizi içeren `.db` dosyasını indirin.")
+            if os.path.exists(DB_FILE):
+                with open(DB_FILE, "rb") as f:
+                    db_bytes = f.read()
+                st.download_button(
+                    label="📥 Veritabanı Yedeğini İndir (portfolio_data.db)",
+                    data=db_bytes,
+                    file_name=f"portfolio_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.db",
+                    mime="application/x-sqlite3"
+                )
+            else:
+                st.warning("Veritabanı dosyası henüz oluşmadı.")
+
+        with c_backup2:
+            st.markdown("#### 2. Yedekten Geri Yükle")
+            st.caption("Daha önce indirdiğiniz `.db` yedek dosyasını yükleyerek tüm verilerinizi geri getirin.")
+            uploaded_db = st.file_uploader("Yedek Dosyasını Seçin (.db)", type=["db", "sqlite"])
+            if uploaded_db is not None:
+                if st.button("Verileri Geri Yükle", type="primary"):
+                    with open(DB_FILE, "wb") as f:
+                        f.write(uploaded_db.getbuffer())
+                    st.success("✅ Tüm portföy verileriniz başarıyla geri yüklendi!")
                     st.rerun()
+
+    with tab2:
+        col_add, col_del = st.columns(2)
+        with col_add:
+            st.subheader("➕ Yeni Portföy Oluştur")
+            p_name = st.text_input("Portföy Adı", placeholder="Örn: Temettü Portföyü")
+            p_curr = st.selectbox("Para Birimi", ["USD", "EUR", "TRY"])
+            if st.button("Portföyü Kaydet", type="primary"):
+                if p_name.strip():
+                    with get_connection() as conn:
+                        conn.cursor().execute("INSERT INTO portfolios (name, currency) VALUES (?, ?)", (p_name.strip(), p_curr))
+                        conn.commit()
+                    st.success(f"{p_name} portföyü başarıyla oluşturuldu.")
+                    st.rerun()
+
+        with col_del:
+            st.subheader("🗑️ Mevcut Portföyleri Sil")
+            if portfolios_df.empty:
+                st.info("Kayıtlı portföy bulunmuyor.")
+            else:
+                for _, p in portfolios_df.iterrows():
+                    p_c1, p_c2 = st.columns([3, 1])
+                    p_c1.write(f"📁 **{p['name']}** ({p['currency']})")
+                    
+                    if p_c2.button("Sil", key=f"del_port_{p['id']}"):
+                        with get_connection() as conn:
+                            cursor = conn.cursor()
+                            cursor.execute("DELETE FROM lots WHERE portfolio_id = ?", (p['id'],))
+                            cursor.execute("DELETE FROM sales WHERE portfolio_id = ?", (p['id'],))
+                            cursor.execute("DELETE FROM portfolios WHERE id = ?", (p['id'],))
+                            conn.commit()
+                        st.success(f"{p['name']} portföyü silindi.")
+                        st.rerun()
 
 # --- 11. EXCEL RAPORU ---
 elif menu == "📥 Excel Raporu":
