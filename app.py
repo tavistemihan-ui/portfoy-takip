@@ -101,6 +101,7 @@ def trigger_auto_backup(action_name="Yeni İşlem"):
 # --- 3. CANLI DÖVİZ KURLARI & CANLI HİSSE FİYATLARI ---
 @st.cache_data(ttl=1800)
 def fetch_live_fx_rates():
+    """İnternetten canlı kurları çeker."""
     rates = {"USD_TRY": 48.78, "EUR_TRY": 53.20, "EUR_USD": 1.09}
     try:
         url = "https://open.er-api.com/v6/latest/USD"
@@ -123,13 +124,16 @@ live_rates = fetch_live_fx_rates()
 
 @st.cache_data(ttl=300)
 def get_live_price(ticker_symbol: str) -> float:
+    """Tek bir hissenin canlı fiyatını güvenilir şekilde çeker."""
     sym = ticker_symbol.strip().upper()
     try:
         t = yf.Ticker(sym)
+        # 1. Yöntem: fast_info (en hızlı ve anlık)
         if hasattr(t, "fast_info") and t.fast_info is not None:
             lp = t.fast_info.get("lastPrice") or t.fast_info.get("previousClose")
             if lp and lp > 0:
                 return round(float(lp), 2)
+        # 2. Yöntem: Son gün kapanışı
         hist = t.history(period="5d")
         if not hist.empty and "Close" in hist:
             closes = hist["Close"].dropna()
@@ -233,6 +237,7 @@ with st.sidebar:
 
 # --- 6. DASHBOARD ---
 if menu == "📊 Dashboard":
+    # Üst Yenileme Butonu
     c_btn, _ = st.columns([2, 5])
     if c_btn.button("🔄 Canlı Fiyatları & Kurları Güncelle"):
         st.cache_data.clear()
@@ -315,6 +320,7 @@ if menu == "📊 Dashboard":
             sym = lot["ticker"].strip().upper()
             live_p = get_live_price(sym)
             
+            # Eğer canlı fiyat çekildiyse onu kullan, çekilemediyse alış fiyatını baz al
             is_live_available = live_p > 0
             eff_price = live_p if is_live_available else lot["buy_price"]
             
@@ -334,7 +340,8 @@ if menu == "📊 Dashboard":
                 "Piyasa Değeri": format_curr(market_val, p_info["currency"]),
                 "Anlık K/Z Tutarı": pnl_val,
                 "Anlık K/Z (%)": pnl_pct,
-                "Maliyet Ham": cost_val
+                "Maliyet Ham": cost_val,
+                "Canlı Var": is_live_available
             })
 
         unrealized_pnl = total_market_val - total_cost
@@ -359,6 +366,7 @@ if menu == "📊 Dashboard":
             st.divider()
             st.subheader("📌 Açık Pozisyonlar Tablosu (Canlı K/Z)")
 
+            # Renkli HTML Tablosu (Pozitif: Yeşil, Negatif: Kırmızı)
             def build_custom_html_table(df, curr):
                 html = """<table style="width:100%; border-collapse: collapse; text-align:left;">
                 <thead>
@@ -384,7 +392,7 @@ if menu == "📊 Dashboard":
                     html += f"""<tr style='border-bottom: 1px solid #21262d;'>
                         <td style='padding:10px; font-weight:bold; color:#e6edf3;'>{row['Hisse']}</td>
                         <td style='padding:10px; color:#8b949e;'>{row['Alış Tarihi']}</td>
-                        <td style='padding:10px; font-weight:600; color:#e6edf3;'>{row['Kalan Lot']:.4f}</td>
+                        <td style='padding:10px; color:#e6edf3;'>{row['Kalan Lot']:.0f}</td>
                         <td style='padding:10px; color:#e6edf3;'>{row['Alış Fiyatı']}</td>
                         <td style='padding:10px; font-weight:600; color:#58a6ff;'>{row['Anlık Fiyat']}</td>
                         <td style='padding:10px; color:#e6edf3;'>{row['Toplam Maliyet']}</td>
@@ -399,7 +407,7 @@ if menu == "📊 Dashboard":
         else:
             st.info("Bu portföyde henüz açık hisse bulunmuyor.")
 
-# --- 7. YENİ İŞLEM / SATIŞ (4 BASAMAK KÜSURATLI LOT DESTEKLİ) ---
+# --- 7. YENİ İŞLEM / SATIŞ ---
 elif menu == "📝 Yeni İşlem / Satış":
     st.title("📝 İşlem Girişi")
     port_dict = {f"{r['name']} ({r['currency']})": (r['id'], r['currency']) for _, r in portfolios_df.iterrows()}
@@ -417,14 +425,13 @@ elif menu == "📝 Yeni İşlem / Satış":
         with c2:
             buy_date_input = st.date_input("Alış Tarihi", datetime.now())
         with c3:
-            # 4 basamaklı hassasiyet
-            shares_input = st.number_input("Adet (Lot)", min_value=0.0001, value=1.0000, step=0.0001, format="%.4f")
+            shares_input = st.number_input("Adet (Lot)", min_value=0.01, value=10.0, step=1.0)
 
         c4, c5 = st.columns(2)
         with c4:
-            price_input = st.number_input(f"Alış Fiyatı ({target_pcurr})", min_value=0.01, value=50.0, step=0.5, format="%.2f")
+            price_input = st.number_input(f"Alış Fiyatı ({target_pcurr})", min_value=0.01, value=50.0, step=1.0)
         with c5:
-            comm_input = st.number_input(f"Komisyon ({target_pcurr})", min_value=0.0, value=default_comm, step=0.1, format="%.2f")
+            comm_input = st.number_input(f"Komisyon ({target_pcurr})", min_value=0.0, value=default_comm, step=0.1)
 
         if st.button("Alışı Kaydet", type="primary"):
             if ticker_input:
@@ -436,8 +443,8 @@ elif menu == "📝 Yeni İşlem / Satış":
                                    (target_pid, ticker_input, str(buy_date_input), price_input, shares_input, shares_input, target_pcurr, comm_input))
                     conn.commit()
                 st.cache_data.clear()
-                trigger_auto_backup(f"🟢 Alış: {shares_input:.4f} Lot {ticker_input} ({price_input} {target_pcurr})")
-                st.success(f"{ticker_input} ({shares_input:.4f} lot) kaydedildi ve yedeği Telegram'a gönderildi!")
+                trigger_auto_backup(f"🟢 Alış: {shares_input} Lot {ticker_input} ({price_input} {target_pcurr})")
+                st.success(f"{ticker_input} ({shares_input} lot) kaydedildi ve yedeği Telegram'a gönderildi!")
                 st.rerun()
 
     else:
@@ -452,9 +459,9 @@ elif menu == "📝 Yeni İşlem / Satış":
             
             cs1, cs2 = st.columns(2)
             with cs1:
-                sale_price = st.number_input(f"Satış Fiyatı ({target_pcurr})", min_value=0.01, value=90.0, step=0.5, format="%.2f")
+                sale_price = st.number_input(f"Satış Fiyatı ({target_pcurr})", min_value=0.01, value=90.0, step=1.0)
             with cs2:
-                sale_comm = st.number_input(f"Satış Komisyonu ({target_pcurr})", min_value=0.0, value=default_comm, step=0.1, format="%.2f")
+                sale_comm = st.number_input(f"Satış Komisyonu ({target_pcurr})", min_value=0.0, value=default_comm, step=0.1)
 
             ticker_lots = open_lots_p[open_lots_p["ticker"] == sel_ticker]
             st.markdown("#### 🎯 Hangi Alıştan Satış Yapmak İstiyorsunuz?")
@@ -467,14 +474,13 @@ elif menu == "📝 Yeni İşlem / Satış":
                 c1, c2, c3, c4 = st.columns([2, 2, 2, 3])
                 c1.write(f"📅 **{lot['buy_date']}**")
                 c2.write(f"Alış: **{format_curr(lot['buy_price'], lot['currency'])}**")
-                c3.write(f"Kalan: **{lot['remaining_shares']:.4f} lot**")
+                c3.write(f"Kalan: **{lot['remaining_shares']} lot**")
                 qty = c4.number_input(
                     f"Sat (Lot #{lot['lot_id']})",
                     min_value=0.0,
                     max_value=float(lot["remaining_shares"]),
                     value=0.0,
-                    step=0.0001,
-                    format="%.4f",
+                    step=1.0,
                     key=f"sell_{lot['lot_id']}"
                 )
                 if qty > 0:
@@ -489,7 +495,7 @@ elif menu == "📝 Yeni İşlem / Satış":
 
                 st.divider()
                 m1, m2, m3, m4 = st.columns(4)
-                m1.metric("Satılacak Lot", f"{total_sold:.4f}")
+                m1.metric("Satılacak Lot", f"{total_sold:.0f}")
                 m2.metric("Alış Maliyeti", format_curr(total_cost, target_pcurr))
                 m3.metric("Satış Geliri", format_curr(proceeds, target_pcurr))
                 m4.metric("Net Kâr/Zarar", format_curr(realized_pnl, target_pcurr), delta=f"%{ret_pct:+.2f}")
@@ -506,7 +512,7 @@ elif menu == "📝 Yeni İşlem / Satış":
                                        (target_pid, sel_ticker, datetime.now().strftime("%Y-%m-%d"), total_sold, sale_price, total_cost, sale_comm, realized_pnl, target_pcurr, sale_price, json.dumps(allocations)))
                         conn.commit()
                     st.cache_data.clear()
-                    trigger_auto_backup(f"🔴 Satış: {total_sold:.4f} Lot {sel_ticker} (K/Z: {realized_pnl:+,.2f} {target_pcurr})")
+                    trigger_auto_backup(f"🔴 Satış: {total_sold} Lot {sel_ticker} (K/Z: {realized_pnl:+,.2f} {target_pcurr})")
                     st.success("Satış tamamlandı ve yedeği Telegram'a gönderildi!")
                     st.rerun()
 
@@ -522,11 +528,12 @@ elif menu == "🎯 Satış Sonrası Analiz":
                 st.markdown(f"### 📌 {sale['ticker']} Satışı (#{sale['sale_id']}) - {sale['sale_date']}")
                 avg_buy_price = (sale["cost"] / sale["shares"]) if sale["shares"] > 0 else 0.0
                 
+                # Canlı fiyatı internetten al
                 live_p = get_live_price(sale['ticker'])
                 current_p = live_p if live_p > 0 else (sale['current_price'] or sale['sale_price'])
 
                 col_m1, col_m2, col_m3, col_m4 = st.columns(4)
-                col_m1.metric("Satılan Adet", f"{sale['shares']:.4f} Lot")
+                col_m1.metric("Satılan Adet", f"{sale['shares']} Lot")
                 col_m1.caption(f"Realize Net K/Z: **{format_curr(sale['realized_pnl'], sale['currency'])}**")
                 col_m2.metric("Orijinal Alış Fiyatı", format_curr(avg_buy_price, sale['currency']))
                 col_m3.metric("Satış Fiyatı", format_curr(sale['sale_price'], sale['currency']))
@@ -582,12 +589,12 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                     e_c1, e_c2, e_c3 = st.columns(3)
                     new_ticker = e_c1.text_input("Ticker", value=lot_to_edit["ticker"]).upper()
                     new_date = e_c2.date_input("Tarih", datetime.strptime(str(lot_to_edit["buy_date"]), "%Y-%m-%d"))
-                    new_price = e_c3.number_input("Alış Fiyatı", value=float(lot_to_edit["buy_price"]), min_value=0.01, format="%.2f")
+                    new_price = e_c3.number_input("Alış Fiyatı", value=float(lot_to_edit["buy_price"]), min_value=0.01)
 
                     e_c4, e_c5 = st.columns(2)
                     is_sold = lot_to_edit["remaining_shares"] != lot_to_edit["initial_shares"]
-                    new_shares = e_c4.number_input("Lot Adedi", value=float(lot_to_edit["initial_shares"]), min_value=0.0001, step=0.0001, format="%.4f", disabled=is_sold)
-                    new_comm = e_c5.number_input("Komisyon", value=float(lot_to_edit["commission"]), min_value=0.0, format="%.2f")
+                    new_shares = e_c4.number_input("Lot Adedi", value=float(lot_to_edit["initial_shares"]), disabled=is_sold)
+                    new_comm = e_c5.number_input("Komisyon", value=float(lot_to_edit["commission"]), min_value=0.0)
 
                     f_b1, f_b2 = st.columns([1, 4])
                     save_edit = f_b1.form_submit_button("Kaydet", type="primary")
@@ -618,7 +625,7 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                 c1.write(f"**{lot['ticker']}** (Lot #{lot['lot_id']})")
                 c2.write(f"Portföy: {p_name}")
                 c3.write(f"📅 {lot['buy_date']} | {format_curr(lot['buy_price'], lot['currency'])}")
-                c4.write(f"Kalan: **{lot['remaining_shares']:.4f}**/{lot['initial_shares']:.4f} Lot")
+                c4.write(f"Kalan: {lot['remaining_shares']}/{lot['initial_shares']} Lot")
 
                 if c5.button("✏️ Düzenle", key=f"edit_btn_{lot['lot_id']}"):
                     st.session_state.edit_lot_id = int(lot["lot_id"])
@@ -649,8 +656,8 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                 with st.form("edit_sale_form"):
                     s_c1, s_c2, s_c3 = st.columns(3)
                     new_s_date = s_c1.date_input("Satış Tarihi", datetime.strptime(str(sale_to_edit["sale_date"]), "%Y-%m-%d"))
-                    new_s_price = s_c2.number_input("Satış Fiyatı", value=float(sale_to_edit["sale_price"]), min_value=0.01, format="%.2f")
-                    new_s_comm = s_c3.number_input("Komisyon", value=float(sale_to_edit["commission"]), min_value=0.0, format="%.2f")
+                    new_s_price = s_c2.number_input("Satış Fiyatı", value=float(sale_to_edit["sale_price"]), min_value=0.01)
+                    new_s_comm = s_c3.number_input("Komisyon", value=float(sale_to_edit["commission"]), min_value=0.0)
 
                     s_b1, s_b2 = st.columns([1, 4])
                     save_s_edit = s_b1.form_submit_button("Kaydet", type="primary")
@@ -681,7 +688,7 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                 c1, c2, c3, c4, c5, c6 = st.columns([2, 2, 2, 2, 1, 1])
                 c1.write(f"**{sale['ticker']}** ({p_name})")
                 c2.write(f"📅 {sale['sale_date']}")
-                c3.write(f"{sale['shares']:.4f} Lot @ {format_curr(sale['sale_price'], sale['currency'])}")
+                c3.write(f"{sale['shares']} Lot @ {format_curr(sale['sale_price'], sale['currency'])}")
                 c4.write(f"Net K/Z: **{format_curr(sale['realized_pnl'], sale['currency'])}**")
 
                 if c5.button("✏️ Düzenle", key=f"edit_sale_btn_{sale['sale_id']}"):
