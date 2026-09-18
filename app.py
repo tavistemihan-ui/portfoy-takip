@@ -1,35 +1,13 @@
+import os
+import io
+import json
+import sqlite3
+import requests
+from datetime import datetime
 import streamlit as st
 import pandas as pd
 import plotly.express as px
-from datetime import datetime
-import io
-import requests
-import sqlite3
-import json
 import yfinance as yf
-
-
-# --- ŞİFRE KORUMA SİSTEMİ ---
-def check_password():
-    if "authenticated" not in st.session_state:
-        st.session_state.authenticated = False
-
-    if not st.session_state.authenticated:
-        st.title("🔒 Portföy Terminali - Giriş")
-        password = st.text_input("Lütfen Parolayı Girin:", type="password")
-        if st.button("Giriş Yap", type="primary"):
-            if password == "a4mB3kfYjRJ3sGv":  # <-- BURAYA KENDİ ŞİFRENİZİ YAZIN
-                st.session_state.authenticated = True
-                st.rerun()
-            else:
-                st.error("Hatalı parola!")
-        return False
-    return True
-
-if not check_password():
-    st.stop()  # Şifre doğru girilene kadar uygulamanın geri kalanını çalıştırmaz
-# ----------------------------
-
 
 st.set_page_config(
     page_title="Portföy Terminal Pro",
@@ -767,11 +745,11 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                     st.success("Satış geri alındı ve lotlar iade edildi.")
                     st.rerun()
 
-# --- 10. PORTFÖY & YEDEKLEME AYARLARI (YENİ EKLENEN BÖLÜM) ---
+# --- 10. PORTFÖY & YEDEKLEME AYARLARI ---
 elif menu == "⚙️ Portföy & Yedekleme Ayarları":
     st.title("⚙️ Portföy ve Veri Yedekleme Yönetimi")
     
-    st.info("💡 **Önemli Bilgi:** Streamlit Cloud uyku moduna geçtiğinde sunucudaki geçici verileri sıfırlar. İşlemlerinizin kalıcı olarak korunması için aşağıdaki **Veritabanı Yedeğini İndir** butonunu kullanarak dosyanızı bilgisayarınızda saklayabilir, site uyandığında **Yedekten Geri Yükle** kısmından saniyeler içinde geri yükleyebilirsiniz.")
+    st.info("💡 **Bilgi:** Streamlit Cloud uyku moduna geçtiğinde sunucudaki geçici verileri sıfırlayabilir. İşlemlerinizin kalıcı olarak korunması için yedeğinizi bilgisayarınıza indirebilir, site uyandığında geri yükleyebilirsiniz.")
 
     tab1, tab2 = st.tabs(["💾 Veritabanı Yedeği Al / Geri Yükle", "📁 Portföy Yönetimi"])
 
@@ -782,27 +760,29 @@ elif menu == "⚙️ Portföy & Yedekleme Ayarları":
         with c_backup1:
             st.markdown("#### 1. Yedeği Bilgisayara İndir")
             st.caption("Tüm portföylerinizi, açık lotlarınızı ve satış geçmişinizi içeren `.db` dosyasını indirin.")
-            if os.path.exists(DB_FILE):
+            
+            db_exists = os.path.exists(DB_FILE)
+            if db_exists:
                 with open(DB_FILE, "rb") as f:
                     db_bytes = f.read()
                 st.download_button(
-                    label="📥 Veritabanı Yedeğini İndir (portfolio_data.db)",
+                    label="📥 Veritabanı Yedeğini İndir (.db)",
                     data=db_bytes,
                     file_name=f"portfolio_backup_{datetime.now().strftime('%Y%m%d_%H%M')}.db",
                     mime="application/x-sqlite3"
                 )
             else:
-                st.warning("Veritabanı dosyası henüz oluşmadı.")
+                st.warning("Veritabanı dosyası henüz diskte oluşturulmadı.")
 
         with c_backup2:
             st.markdown("#### 2. Yedekten Geri Yükle")
-            st.caption("Daha önce indirdiğiniz `.db` yedek dosyasını yükleyerek tüm verilerinizi geri getirin.")
+            st.caption("Daha önce indirdiğiniz `.db` dosyasını yükleyin.")
             uploaded_db = st.file_uploader("Yedek Dosyasını Seçin (.db)", type=["db", "sqlite"])
             if uploaded_db is not None:
                 if st.button("Verileri Geri Yükle", type="primary"):
                     with open(DB_FILE, "wb") as f:
                         f.write(uploaded_db.getbuffer())
-                    st.success("✅ Tüm portföy verileriniz başarıyla geri yüklendi!")
+                    st.success("✅ Veritabanınız başarıyla geri yüklendi!")
                     st.rerun()
 
     with tab2:
