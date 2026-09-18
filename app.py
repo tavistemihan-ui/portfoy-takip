@@ -98,7 +98,7 @@ def _send_telegram_thread(caption_text):
 def trigger_auto_backup(action_name="Yeni İşlem"):
     threading.Thread(target=_send_telegram_thread, args=(action_name,), daemon=True).start()
 
-# --- 3. CANLI DÖVİZ KURLARI & CANLI HİSSE FİYATLARI ---
+# --- 3. CANLI DÖVİZ KURLARI, HİSSE FİYATLARI VE SEKTÖRLER ---
 @st.cache_data(ttl=1800)
 def fetch_live_fx_rates():
     rates = {"USD_TRY": 48.78, "EUR_TRY": 53.20, "EUR_USD": 1.09}
@@ -138,6 +138,19 @@ def get_live_price(ticker_symbol: str) -> float:
     except Exception:
         pass
     return 0.0
+
+@st.cache_data(ttl=86400)
+def get_stock_sector(ticker_symbol: str) -> str:
+    """Hissenin sektörünü çeker ve 24 saat önbellekte tutar."""
+    sym = ticker_symbol.strip().upper()
+    try:
+        t = yf.Ticker(sym)
+        info = t.info
+        if info and "sector" in info and info["sector"]:
+            return str(info["sector"])
+    except Exception:
+        pass
+    return "Genel"
 
 def format_curr(amount: float, curr: str) -> str:
     if curr == "USD":
@@ -247,6 +260,7 @@ if menu == "📊 Dashboard":
         total_val_base = 0.0
         total_realized_base = 0.0
         portfolio_rows = []
+        consolidated_position_rows = []
 
         for _, p in portfolios_df.iterrows():
             p_lots = lots_df[lots_df["portfolio_id"] == p["id"]]
@@ -258,9 +272,29 @@ if menu == "📊 Dashboard":
 
             p_cur_val = 0.0
             for _, lot in p_lots.iterrows():
-                live_p = get_live_price(lot["ticker"])
+                sym = lot["ticker"].strip().upper()
+                live_p = get_live_price(sym)
+                sec = get_stock_sector(sym)
                 eff_p = live_p if live_p > 0 else lot["buy_price"]
-                p_cur_val += lot["remaining_shares"] * eff_p
+                
+                pos_cost = lot["remaining_shares"] * lot["buy_price"]
+                pos_val = lot["remaining_shares"] * eff_p
+                pos_cost_b = convert_to_base(pos_cost, p["currency"], base_currency)
+                pos_val_b = convert_to_base(pos_val, p["currency"], base_currency)
+                
+                p_cur_val += pos_val
+                
+                consolidated_position_rows.append({
+                    "Portföy": p["name"],
+                    "Hisse": sym,
+                    "Sektör": sec,
+                    "Kalan Lot": lot["remaining_shares"],
+                    f"Piyasa Değeri ({base_currency})": pos_val_b,
+                    f"Maliyet ({base_currency})": pos_cost_b,
+                    "Anlık K/Z Tutarı": pos_val_b - pos_cost_b,
+                    "Anlık K/Z (%)": ((pos_val_b - pos_cost_b) / pos_cost_b * 100) if pos_cost_b > 0 else 0.0,
+                    "Değer Ham": pos_val_b
+                })
 
             p_val_b = convert_to_base(p_cur_val, p["currency"], base_currency)
             total_val_base += p_val_b
@@ -285,18 +319,59 @@ if menu == "📊 Dashboard":
         c4.metric("Realize Edilmiş K/Z", format_curr(total_realized_base, base_currency))
 
         st.divider()
-        col1, col2 = st.columns(2)
-        with col1:
-            st.subheader("Portföy Dağılımı")
-            if total_val_base > 0:
-                fig = px.pie(pd.DataFrame(portfolio_rows), names="Portföy", values="Değer Ham", hole=0.4, template="plotly_dark")
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                st.info("Portföyde açık hisse yok.")
-        with col2:
-            st.subheader("Özet Tablo")
-            df_disp = pd.DataFrame(portfolio_rows).drop(columns=["Değer Ham"])
-            st.dataframe(df_disp, hide_index=True, use_container_width=True)
+
+        # KONSOLİDE PASTA GRAFİKLERİ (Portföy & Sektörel Dağılım)
+        if consolidated_position_rows:
+            df_cons_pos = pd.DataFrame(consolidated_position_rows)
+            col1, col2 = st.columns(2)
+            with col1:
+                st.subheader("🥧 Portföy Dağılımı (%)")
+                fig_port = px.pie(pd.DataFrame(portfolio_rows), names="Portföy", values="Değer Ham", hole=0.4, template="plotly_dark")
+                st.plotly_chart(fig_port, use_container_width=True)
+
+            with col2:
+                st.subheader("🏭 Konsolide Sektörel Dağılım (%)")
+                sec_agg = df_cons_pos.groupby("Sektör")["Değer Ham"].sum().reset_index()
+                fig_sec = px.pie(sec_agg, names="Sektör", values="Değer Ham", hole=0.4, template="plotly_dark")
+                st.plotly_chart(fig_sec, use_container_width=True)
+
+            st.divider()
+            st.subheader("📌 Konsolide Pozisyon Tablosu")
+            
+            # HTML Tablosu
+            html_cons = f"""<table style="width:100%; border-collapse: collapse; text-align:left;">
+            <thead>
+                <tr style="border-bottom: 2px solid #30363d; background-color:#161b22;">
+                    <th style="padding:10px; color:#c9d1d9;">Portföy</th>
+                    <th style="padding:10px; color:#c9d1d9;">Hisse</th>
+                    <th style="padding:10px; color:#c9d1d9;">Sektör</th>
+                    <th style="padding:10px; color:#c9d1d9;">Kalan Lot</th>
+                    <th style="padding:10px; color:#c9d1d9;">Maliyet ({base_currency})</th>
+                    <th style="padding:10px; color:#c9d1d9;">Piyasa Değeri ({base_currency})</th>
+                    <th style="padding:10px; color:#c9d1d9;">Anlık K/Z ({base_currency})</th>
+                    <th style="padding:10px; color:#c9d1d9;">Anlık K/Z (%)</th>
+                </tr>
+            </thead>
+            <tbody>"""
+
+            for _, row in df_cons_pos.iterrows():
+                pnl = row["Anlık K/Z Tutarı"]
+                pct = row["Anlık K/Z (%)"]
+                color = "#2ea043" if pnl >= 0 else "#f85149"
+                html_cons += f"""<tr style='border-bottom: 1px solid #21262d;'>
+                    <td style='padding:10px; color:#8b949e;'>{row['Portföy']}</td>
+                    <td style='padding:10px; font-weight:bold; color:#e6edf3;'>{row['Hisse']}</td>
+                    <td style='padding:10px; color:#58a6ff;'>{row['Sektör']}</td>
+                    <td style='padding:10px; color:#e6edf3;'>{row['Kalan Lot']:.2f}</td>
+                    <td style='padding:10px; color:#e6edf3;'>{format_curr(row[f'Maliyet ({base_currency})'], base_currency)}</td>
+                    <td style='padding:10px; color:#e6edf3;'>{format_curr(row[f'Piyasa Değeri ({base_currency})'], base_currency)}</td>
+                    <td style='padding:10px; font-weight:bold; color:{color};'>{format_curr(pnl, base_currency)}</td>
+                    <td style='padding:10px; font-weight:bold; color:{color};'>%{pct:+.2f}</td>
+                </tr>"""
+            html_cons += "</tbody></table>"
+            st.write(html_cons, unsafe_allow_html=True)
+        else:
+            st.info("Portföyde açık hisse yok.")
 
     else:
         p_info = portfolios_df[portfolios_df["id"] == current_p_id].iloc[0]
@@ -314,6 +389,7 @@ if menu == "📊 Dashboard":
         for _, lot in p_lots.iterrows():
             sym = lot["ticker"].strip().upper()
             live_p = get_live_price(sym)
+            sec = get_stock_sector(sym)
             
             is_live_available = live_p > 0
             eff_price = live_p if is_live_available else lot["buy_price"]
@@ -326,16 +402,17 @@ if menu == "📊 Dashboard":
 
             lot_table_data.append({
                 "Hisse": sym,
+                "Sektör": sec,
                 "Alış Tarihi": lot["buy_date"],
                 "Kalan Lot": lot["remaining_shares"],
                 "Alış Fiyatı": format_curr(lot["buy_price"], p_info["currency"]),
-                "Anlık Fiyat": format_curr(eff_price, p_info["currency"]) if is_live_available else "⚠️ Veri Alınamadı",
+                "Anlık Fiyat": format_curr(eff_price, p_info["currency"]) if is_live_available else "⚠️ Alınamadı",
                 "Toplam Maliyet": format_curr(cost_val, p_info["currency"]),
                 "Piyasa Değeri": format_curr(market_val, p_info["currency"]),
                 "Anlık K/Z Tutarı": pnl_val,
                 "Anlık K/Z (%)": pnl_pct,
-                "Maliyet Ham": cost_val,
-                "Canlı Var": is_live_available
+                "Piyasa Değeri Ham": market_val,
+                "Maliyet Ham": cost_val
             })
 
         unrealized_pnl = total_market_val - total_cost
@@ -352,20 +429,30 @@ if menu == "📊 Dashboard":
         if lot_table_data:
             df_full = pd.DataFrame(lot_table_data)
 
-            st.subheader("🥧 Varlık Dağılımı (%)")
-            asset_agg = df_full.groupby("Hisse")["Maliyet Ham"].sum().reset_index()
-            fig_asset = px.pie(asset_agg, names="Hisse", values="Maliyet Ham", hole=0.4, template="plotly_dark")
-            st.plotly_chart(fig_asset, use_container_width=True)
+            # 1. VARLIK DAĞILIMI & 2. SEKTÖREL DAĞILIM PASTA GRAFİKLERİ
+            g1, g2 = st.columns(2)
+            with g1:
+                st.subheader("🥧 Portföy Varlık Dağılımı (%)")
+                asset_agg = df_full.groupby("Hisse")["Piyasa Değeri Ham"].sum().reset_index()
+                fig_asset = px.pie(asset_agg, names="Hisse", values="Piyasa Değeri Ham", hole=0.4, template="plotly_dark")
+                st.plotly_chart(fig_asset, use_container_width=True)
+
+            with g2:
+                st.subheader("🏭 Sektörel Portföy Dağılımı (%)")
+                sector_agg = df_full.groupby("Sektör")["Piyasa Değeri Ham"].sum().reset_index()
+                fig_sector = px.pie(sector_agg, names="Sektör", values="Piyasa Değeri Ham", hole=0.4, template="plotly_dark")
+                st.plotly_chart(fig_sector, use_container_width=True)
 
             st.divider()
-            st.subheader("📌 Açık Pozisyonlar Tablosu (Canlı K/Z)")
+            st.subheader("📌 Açık Pozisyonlar Tablosu (Canlı K/Z ve Sektör)")
 
-            # Renkli HTML Tablosu (Kalan Lot 2 basamaklı yapıldı)
+            # Renkli HTML Tablosu (Sektör sütunu ve 2 basamaklı Kalan Lot dahil)
             def build_custom_html_table(df, curr):
                 html = """<table style="width:100%; border-collapse: collapse; text-align:left;">
                 <thead>
                     <tr style="border-bottom: 2px solid #30363d; background-color:#161b22;">
                         <th style="padding:10px; color:#c9d1d9;">Hisse</th>
+                        <th style="padding:10px; color:#c9d1d9;">Sektör</th>
                         <th style="padding:10px; color:#c9d1d9;">Alış Tarihi</th>
                         <th style="padding:10px; color:#c9d1d9;">Kalan Lot</th>
                         <th style="padding:10px; color:#c9d1d9;">Alış Fiyatı</th>
@@ -385,6 +472,7 @@ if menu == "📊 Dashboard":
 
                     html += f"""<tr style='border-bottom: 1px solid #21262d;'>
                         <td style='padding:10px; font-weight:bold; color:#e6edf3;'>{row['Hisse']}</td>
+                        <td style='padding:10px; color:#58a6ff;'>{row['Sektör']}</td>
                         <td style='padding:10px; color:#8b949e;'>{row['Alış Tarihi']}</td>
                         <td style='padding:10px; color:#e6edf3;'>{row['Kalan Lot']:.2f}</td>
                         <td style='padding:10px; color:#e6edf3;'>{row['Alış Fiyatı']}</td>
