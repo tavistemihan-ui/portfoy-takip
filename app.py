@@ -8,6 +8,7 @@ from datetime import datetime
 import streamlit as st
 import pandas as pd
 import plotly.express as px
+import yfinance as yf
 
 st.set_page_config(
     page_title="Portföy Terminal Pro",
@@ -75,7 +76,7 @@ def init_db():
 
 init_db()
 
-# --- 2. TELEGRAM OTOMATİK YEDEKLEME MOTORU (ARKA PLANDA ÇALIŞIR) ---
+# --- 2. TELEGRAM OTOMATİK YEDEKLEME MOTORU ---
 def _send_telegram_thread(caption_text):
     try:
         bot_token = st.secrets.get("TELEGRAM_BOT_TOKEN")
@@ -95,11 +96,30 @@ def _send_telegram_thread(caption_text):
         pass
 
 def trigger_auto_backup(action_name="Yeni İşlem"):
-    """Sayfa akışını yavaşlatmadan arka planda Telegram'a dosya atar."""
     threading.Thread(target=_send_telegram_thread, args=(action_name,), daemon=True).start()
 
-# --- 3. DÖVİZ KURLARI & FORMATLAMA ---
+# --- 3. DÖVİZ KURLARI & HIZLI CANLI PİYASA MOTORU ---
 FIXED_RATES = {"USD_TRY": 34.20, "EUR_TRY": 37.80, "EUR_USD": 1.10}
+
+@st.cache_data(ttl=600)
+def get_batch_market_prices(tickers_tuple):
+    """Açık pozisyonlardaki hisselerin son fiyatlarını hızlıca çeker."""
+    prices = {}
+    if not tickers_tuple:
+        return prices
+    try:
+        ticker_str = " ".join([t.strip().upper() for t in tickers_tuple])
+        data = yf.download(ticker_str, period="2d", interval="1d", group_by="ticker", threads=True, progress=False)
+        for sym in tickers_tuple:
+            sym_clean = sym.strip().upper()
+            sub_df = data[sym_clean] if len(tickers_tuple) > 1 else data
+            if not sub_df.empty and "Close" in sub_df:
+                closes = sub_df["Close"].dropna()
+                if not closes.empty:
+                    prices[sym_clean] = round(float(closes.iloc[-1]), 2)
+    except Exception:
+        pass
+    return prices
 
 def format_curr(amount: float, curr: str) -> str:
     if curr == "USD":
@@ -199,9 +219,14 @@ if menu == "📊 Dashboard":
     lots_df = load_open_lots()
     sales_df = load_sales()
 
+    # Canlı piyasa fiyatlarını önbellekten topluca çek
+    open_syms = tuple(sorted(lots_df["ticker"].unique())) if not lots_df.empty else ()
+    live_prices = get_batch_market_prices(open_syms)
+
     if is_consolidated:
         st.title(f"🌐 Konsolide Portföy ({base_currency})")
         total_cost_base = 0.0
+        total_val_base = 0.0
         total_realized_base = 0.0
         portfolio_rows = []
 
@@ -213,32 +238,46 @@ if menu == "📊 Dashboard":
             p_cost_b = convert_to_base(p_cost, p["currency"], base_currency)
             total_cost_base += p_cost_b
 
+            p_cur_val = 0.0
+            for _, lot in p_lots.iterrows():
+                sym = lot["ticker"].strip().upper()
+                cur_p = live_prices.get(sym, lot["buy_price"])
+                p_cur_val += lot["remaining_shares"] * cur_p
+
+            p_val_b = convert_to_base(p_cur_val, p["currency"], base_currency)
+            total_val_base += p_val_b
+
             p_pnl = p_sales["realized_pnl"].sum() if not p_sales.empty else 0.0
             total_realized_base += convert_to_base(p_pnl, p["currency"], base_currency)
 
             portfolio_rows.append({
                 "Portföy": p["name"],
                 "Toplam Maliyet": format_curr(p_cost_b, base_currency),
-                "Maliyet Ham": p_cost_b
+                "Güncel Değer": format_curr(p_val_b, base_currency),
+                "Değer Ham": p_val_b
             })
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Toplam Portföy Maliyeti", format_curr(total_cost_base, base_currency))
-        c2.metric("Toplam Realize Edilmiş K/Z", format_curr(total_realized_base, base_currency))
-        c3.metric("Tanımlı Portföy Sayısı", f"{len(portfolios_df)} Adet")
+        unrealized_base = total_val_base - total_cost_base
+        unrealized_pct = (unrealized_base / total_cost_base * 100) if total_cost_base > 0 else 0
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Toplam Portföy Değeri", format_curr(total_val_base, base_currency))
+        c2.metric("Toplam Alış Maliyeti", format_curr(total_cost_base, base_currency))
+        c3.metric("Anlık Kâr/Zarar", format_curr(unrealized_base, base_currency), delta=f"%{unrealized_pct:+.2f}")
+        c4.metric("Realize Edilmiş K/Z", format_curr(total_realized_base, base_currency))
 
         st.divider()
         col1, col2 = st.columns(2)
         with col1:
             st.subheader("Portföy Dağılımı")
-            if total_cost_base > 0:
-                fig = px.pie(pd.DataFrame(portfolio_rows), names="Portföy", values="Maliyet Ham", hole=0.4, template="plotly_dark")
+            if total_val_base > 0:
+                fig = px.pie(pd.DataFrame(portfolio_rows), names="Portföy", values="Değer Ham", hole=0.4, template="plotly_dark")
                 st.plotly_chart(fig, use_container_width=True)
             else:
                 st.info("Portföyde açık hisse yok.")
         with col2:
             st.subheader("Özet Tablo")
-            df_disp = pd.DataFrame(portfolio_rows).drop(columns=["Maliyet Ham"])
+            df_disp = pd.DataFrame(portfolio_rows).drop(columns=["Değer Ham"])
             st.dataframe(df_disp, hide_index=True, use_container_width=True)
 
     else:
@@ -251,27 +290,92 @@ if menu == "📊 Dashboard":
         total_cost = (p_lots["remaining_shares"] * p_lots["buy_price"]).sum() if not p_lots.empty else 0.0
         realized_pnl = p_sales["realized_pnl"].sum() if not p_sales.empty else 0.0
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Mevcut Varlık Tutarı", format_curr(total_cost, p_info['currency']))
-        c2.metric("Realize Edilmiş K/Z", format_curr(realized_pnl, p_info['currency']))
-        c3.metric("Açık Lot Kalemi", f"{len(p_lots)} Adet")
+        lot_table_data = []
+        total_market_val = 0.0
+
+        for _, lot in p_lots.iterrows():
+            sym = lot["ticker"].strip().upper()
+            live_p = live_prices.get(sym, lot["buy_price"])
+            market_val = lot["remaining_shares"] * live_p
+            cost_val = lot["remaining_shares"] * lot["buy_price"]
+            pnl_val = market_val - cost_val
+            pnl_pct = (pnl_val / cost_val * 100) if cost_val > 0 else 0.0
+            total_market_val += market_val
+
+            lot_table_data.append({
+                "Hisse": sym,
+                "Alış Tarihi": lot["buy_date"],
+                "Kalan Lot": lot["remaining_shares"],
+                "Alış Fiyatı": format_curr(lot["buy_price"], p_info["currency"]),
+                "Anlık Fiyat": format_curr(live_p, p_info["currency"]),
+                "Toplam Maliyet": format_curr(cost_val, p_info["currency"]),
+                "Piyasa Değeri": format_curr(market_val, p_info["currency"]),
+                "Anlık K/Z Tutarı": pnl_val,
+                "Anlık K/Z (%)": pnl_pct,
+                "Maliyet Ham": cost_val
+            })
+
+        unrealized_pnl = total_market_val - total_cost
+        unrealized_pct = (unrealized_pnl / total_cost * 100) if total_cost > 0 else 0.0
+
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Güncel Portföy Değeri", format_curr(total_market_val, p_info['currency']))
+        c2.metric("Toplam Alış Maliyeti", format_curr(total_cost, p_info['currency']))
+        c3.metric("Anlık Kâr/Zarar", format_curr(unrealized_pnl, p_info['currency']), delta=f"%{unrealized_pct:+.2f}")
+        c4.metric("Realize Edilmiş K/Z", format_curr(realized_pnl, p_info['currency']))
 
         st.divider()
 
-        if not p_lots.empty:
-            p_lots["Toplam Maliyet"] = p_lots["remaining_shares"] * p_lots["buy_price"]
+        if lot_table_data:
+            df_full = pd.DataFrame(lot_table_data)
+
+            # Pasta Grafiği
             st.subheader("🥧 Varlık Dağılımı (%)")
-            asset_agg = p_lots.groupby("ticker")["Toplam Maliyet"].sum().reset_index()
-            fig_asset = px.pie(asset_agg, names="ticker", values="Toplam Maliyet", hole=0.4, template="plotly_dark")
+            asset_agg = df_full.groupby("Hisse")["Maliyet Ham"].sum().reset_index()
+            fig_asset = px.pie(asset_agg, names="Hisse", values="Maliyet Ham", hole=0.4, template="plotly_dark")
             st.plotly_chart(fig_asset, use_container_width=True)
 
             st.divider()
-            st.subheader("📌 Açık Pozisyonlar Tablosu")
-            display_df = p_lots[["ticker", "buy_date", "remaining_shares", "buy_price", "Toplam Maliyet"]].copy()
-            display_df.columns = ["Hisse", "Alış Tarihi", "Kalan Lot", "Alış Fiyatı", "Toplam Maliyet"]
-            display_df["Alış Fiyatı"] = display_df["Alış Fiyatı"].apply(lambda x: format_curr(x, p_info['currency']))
-            display_df["Toplam Maliyet"] = display_df["Toplam Maliyet"].apply(lambda x: format_curr(x, p_info['currency']))
-            st.dataframe(display_df, hide_index=True, use_container_width=True)
+            st.subheader("📌 Açık Pozisyonlar Tablosu (Canlı K/Z Durumu)")
+
+            # Renkli HTML Tablosu (Pozitif: Yeşil, Negatif: Kırmızı)
+            def build_custom_html_table(df, curr):
+                html = """<table style="width:100%; border-collapse: collapse; text-align:left;">
+                <thead>
+                    <tr style="border-bottom: 2px solid #30363d; background-color:#161b22;">
+                        <th style="padding:10px; color:#c9d1d9;">Hisse</th>
+                        <th style="padding:10px; color:#c9d1d9;">Alış Tarihi</th>
+                        <th style="padding:10px; color:#c9d1d9;">Kalan Lot</th>
+                        <th style="padding:10px; color:#c9d1d9;">Alış Fiyatı</th>
+                        <th style="padding:10px; color:#c9d1d9;">Anlık Fiyat</th>
+                        <th style="padding:10px; color:#c9d1d9;">Toplam Maliyet</th>
+                        <th style="padding:10px; color:#c9d1d9;">Piyasa Değeri</th>
+                        <th style="padding:10px; color:#c9d1d9;">Anlık K/Z Tutarı</th>
+                        <th style="padding:10px; color:#c9d1d9;">Anlık K/Z (%)</th>
+                    </tr>
+                </thead>
+                <tbody>"""
+
+                for _, row in df.iterrows():
+                    pnl_val = row["Anlık K/Z Tutarı"]
+                    pnl_pct = row["Anlık K/Z (%)"]
+                    color = "#2ea043" if pnl_val >= 0 else "#f85149"
+
+                    html += f"""<tr style='border-bottom: 1px solid #21262d;'>
+                        <td style='padding:10px; font-weight:bold; color:#e6edf3;'>{row['Hisse']}</td>
+                        <td style='padding:10px; color:#8b949e;'>{row['Alış Tarihi']}</td>
+                        <td style='padding:10px; color:#e6edf3;'>{row['Kalan Lot']:.0f}</td>
+                        <td style='padding:10px; color:#e6edf3;'>{row['Alış Fiyatı']}</td>
+                        <td style='padding:10px; font-weight:600; color:#58a6ff;'>{row['Anlık Fiyat']}</td>
+                        <td style='padding:10px; color:#e6edf3;'>{row['Toplam Maliyet']}</td>
+                        <td style='padding:10px; color:#e6edf3;'>{row['Piyasa Değeri']}</td>
+                        <td style='padding:10px; font-weight:bold; color:{color};'>{format_curr(pnl_val, curr)}</td>
+                        <td style='padding:10px; font-weight:bold; color:{color};'>%{pnl_pct:+.2f}</td>
+                    </tr>"""
+                html += "</tbody></table>"
+                return html
+
+            st.write(build_custom_html_table(df_full, p_info["currency"]), unsafe_allow_html=True)
         else:
             st.info("Bu portföyde henüz açık hisse bulunmuyor.")
 
@@ -289,7 +393,7 @@ elif menu == "📝 Yeni İşlem / Satış":
         st.subheader("Yeni Alış Kaydı")
         c1, c2, c3 = st.columns(3)
         with c1:
-            ticker_input = st.text_input("Hisse Kodu (Ticker)", value="AAPL").strip().upper()
+            ticker_input = st.text_input("Hisse Kodu (Ticker - örn: AAPL, THYAO.IS)", value="AAPL").strip().upper()
         with c2:
             buy_date_input = st.date_input("Alış Tarihi", datetime.now())
         with c3:
@@ -310,6 +414,7 @@ elif menu == "📝 Yeni İşlem / Satış":
                                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)''',
                                    (target_pid, ticker_input, str(buy_date_input), price_input, shares_input, shares_input, target_pcurr, comm_input))
                     conn.commit()
+                st.cache_data.clear()
                 trigger_auto_backup(f"🟢 Alış: {shares_input} Lot {ticker_input} ({price_input} {target_pcurr})")
                 st.success(f"{ticker_input} ({shares_input} lot) kaydedildi ve yedeği Telegram'a gönderildi!")
                 st.rerun()
@@ -378,6 +483,7 @@ elif menu == "📝 Yeni İşlem / Satış":
                                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',
                                        (target_pid, sel_ticker, datetime.now().strftime("%Y-%m-%d"), total_sold, sale_price, total_cost, sale_comm, realized_pnl, target_pcurr, sale_price, json.dumps(allocations)))
                         conn.commit()
+                    st.cache_data.clear()
                     trigger_auto_backup(f"🔴 Satış: {total_sold} Lot {sel_ticker} (K/Z: {realized_pnl:+,.2f} {target_pcurr})")
                     st.success("Satış tamamlandı ve yedeği Telegram'a gönderildi!")
                     st.rerun()
@@ -487,6 +593,7 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                                            (new_ticker, str(new_date), new_price, new_shares, rem_shares, new_comm, int(lot_to_edit["lot_id"])))
                             conn.commit()
                         st.session_state.edit_lot_id = None
+                        st.cache_data.clear()
                         trigger_auto_backup(f"✏️ Düzenleme: Lot #{lot_to_edit['lot_id']}")
                         st.success("Alış kaydı güncellendi ve Telegram yedeği gönderildi!")
                         st.rerun()
@@ -514,6 +621,7 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                             cursor = conn.cursor()
                             cursor.execute("DELETE FROM lots WHERE lot_id = ?", (int(lot["lot_id"]),))
                             conn.commit()
+                        st.cache_data.clear()
                         trigger_auto_backup(f"🗑️ Silme: Lot #{lot['lot_id']}")
                         st.success("Alış silindi ve Telegram yedeği gönderildi.")
                         st.rerun()
@@ -593,7 +701,6 @@ elif menu == "💾 Yedekleme & Portföy Ayarları":
     with tab1:
         st.subheader("💾 Veritabanı Yedekleme")
         
-        # Test Gönderim Butonu
         if "TELEGRAM_BOT_TOKEN" in st.secrets:
             if st.button("🚀 Şimdi Telegram'a Test Yedeği Gönder", type="secondary"):
                 trigger_auto_backup("Manuel Test Yedeği")
