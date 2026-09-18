@@ -4,4 +4,3 @@ plotly
 openpyxl
 requests
 yfinance
-psycopg2-binary
