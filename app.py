@@ -131,19 +131,16 @@ def get_live_price(ticker_symbol: str) -> float:
     sym = ticker_symbol.strip().upper()
     try:
         t = yf.Ticker(sym)
-        # 1. Öncelik: fast_info
         if hasattr(t, "fast_info") and t.fast_info is not None:
             lp = t.fast_info.get("lastPrice") or t.fast_info.get("previousClose")
             if lp and float(lp) > 0:
                 return round(float(lp), 2)
-        # 2. Öncelik: info
         try:
             info_price = t.info.get("regularMarketPrice") or t.info.get("currentPrice")
             if info_price and float(info_price) > 0:
                 return round(float(info_price), 2)
         except Exception:
             pass
-        # 3. Öncelik: history
         hist = t.history(period="5d")
         if not hist.empty and "Close" in hist:
             closes = hist["Close"].dropna()
@@ -240,10 +237,20 @@ def load_portfolios():
         return pd.read_sql("SELECT * FROM portfolios ORDER BY id", conn)
 
 def load_open_lots(portfolio_id=None):
+    """Sadece elde açık kalan hisseleri getirir (Dashboard için)"""
     with get_connection() as conn:
         q = "SELECT * FROM lots WHERE remaining_shares > 0"
         if portfolio_id:
             q += f" AND portfolio_id = {portfolio_id}"
+        return pd.read_sql(q, conn)
+
+def load_all_lots(portfolio_id=None):
+    """Kapanmış (0 kalmış) dahil BÜTÜN alış lotlarını getirir (Düzeltme Menüsü için)"""
+    with get_connection() as conn:
+        q = "SELECT * FROM lots"
+        if portfolio_id:
+            q += f" WHERE portfolio_id = {portfolio_id}"
+        q += " ORDER BY lot_id DESC"
         return pd.read_sql(q, conn)
 
 def load_sales(portfolio_id=None):
@@ -884,13 +891,14 @@ elif menu == "🎯 Satış Sonrası Analiz":
 
                 st.divider()
 
-# --- 10. GEÇMİŞ İŞLEM YÖNETİMİ & DÜZELTME ---
+# --- 10. GEÇMİŞ İŞLEM YÖNETİMİ & DÜZELTME (TÜM ALIŞLAR GÖRÜNÜR) ---
 elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
     st.title("✏️ İşlem Düzeltme, Güncelleme ve Silme")
     tab_buys, tab_sales = st.tabs(["🟢 Alış Lotlarını Düzelt / Sil", "🔴 Satış Kayıtlarını Düzelt / Geri Al"])
 
     with tab_buys:
-        all_lots = load_open_lots()
+        # BURASI GÜNCELLENDİ: load_open_lots yerine load_all_lots kullanılarak satılmış lotlar da getirildi
+        all_lots = load_all_lots()
         if all_lots.empty:
             st.info("Kayıtlı alış bulunmuyor.")
         else:
@@ -905,8 +913,9 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                     new_price = e_c3.number_input("Alış Fiyatı", value=float(lot_to_edit["buy_price"]), min_value=0.01)
 
                     e_c4, e_c5 = st.columns(2)
-                    is_sold = lot_to_edit["remaining_shares"] != lot_to_edit["initial_shares"]
-                    new_shares = e_c4.number_input("Lot Adedi", value=float(lot_to_edit["initial_shares"]), step=0.01, format="%.2f", disabled=is_sold)
+                    is_sold_any = float(lot_to_edit["remaining_shares"]) != float(lot_to_edit["initial_shares"])
+                    # Eğer satış yapılmışsa toplam adedi değiştirmek veritabanı tutarlılığını bozar; kilitli tutulur.
+                    new_shares = e_c4.number_input("Lot Adedi", value=float(lot_to_edit["initial_shares"]), step=0.01, format="%.2f", disabled=is_sold_any)
                     new_comm = e_c5.number_input("Komisyon", value=float(lot_to_edit["commission"]), min_value=0.0)
 
                     f_b1, f_b2 = st.columns([1, 4])
@@ -914,17 +923,38 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                     cancel_edit = f_b2.form_submit_button("İptal")
 
                     if save_edit:
-                        rem_shares = new_shares if not is_sold else lot_to_edit["remaining_shares"]
+                        rem_shares = new_shares if not is_sold_any else lot_to_edit["remaining_shares"]
                         with get_connection() as conn:
                             cursor = conn.cursor()
                             cursor.execute('''UPDATE lots SET ticker = ?, buy_date = ?, buy_price = ?, initial_shares = ?, remaining_shares = ?, commission = ? 
                                               WHERE lot_id = ?''',
                                            (new_ticker, str(new_date), new_price, new_shares, rem_shares, new_comm, int(lot_to_edit["lot_id"])))
+                            
+                            # Eğer alış fiyatı değiştiyse bu lottan yapılan satışların maliyetini ve realize K/Z'sini otomatik güncelle
+                            if new_price != float(lot_to_edit["buy_price"]):
+                                s_rows = cursor.execute("SELECT sale_id, shares, sale_price, commission, allocations_json FROM sales WHERE ticker = ?", (lot_to_edit["ticker"],)).fetchall()
+                                for s_id, s_shares, s_price, s_comm, s_allocs_str in s_rows:
+                                    if s_allocs_str:
+                                        try:
+                                            allocs = json.loads(s_allocs_str)
+                                            updated_allocs = []
+                                            tot_cost = 0.0
+                                            for item in allocs:
+                                                if item.get("lot_id") == int(lot_to_edit["lot_id"]):
+                                                    item["buy_price"] = new_price
+                                                tot_cost += (item["qty"] * item["buy_price"])
+                                                updated_allocs.append(item)
+                                            new_pnl = (s_shares * s_price) - tot_cost - s_comm
+                                            cursor.execute("UPDATE sales SET cost = ?, realized_pnl = ?, allocations_json = ? WHERE sale_id = ?",
+                                                           (tot_cost, new_pnl, json.dumps(updated_allocs), s_id))
+                                        except Exception:
+                                            pass
                             conn.commit()
+
                         st.session_state.edit_lot_id = None
                         st.cache_data.clear()
-                        trigger_auto_backup(f"✏️ Düzenleme: Lot #{lot_to_edit['lot_id']}")
-                        st.success("Alış kaydı güncellendi ve Telegram yedeği gönderildi!")
+                        trigger_auto_backup(f"✏️ Düzenleme: Lot #{lot_to_edit['lot_id']} ({new_ticker})")
+                        st.success("Alış kaydı ve bağlı satış kâr/zararları güncellendi!")
                         st.rerun()
 
                     if cancel_edit:
@@ -934,17 +964,30 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
             for _, lot in all_lots.iterrows():
                 p_row = portfolios_df[portfolios_df["id"] == lot["portfolio_id"]]
                 p_name = p_row.iloc[0]["name"] if not p_row.empty else ""
-                c1, c2, c3, c4, c5, c6 = st.columns([2, 2, 2, 2, 1, 1])
+                rem = float(lot['remaining_shares'])
+                init_sh = float(lot['initial_shares'])
+
+                c1, c2, c3, c4, c5, c6 = st.columns([2, 2, 2, 2.5, 1, 1])
                 c1.write(f"**{lot['ticker']}** (Lot #{lot['lot_id']})")
                 c2.write(f"Portföy: {p_name}")
                 c3.write(f"📅 {lot['buy_date']} | {format_curr(lot['buy_price'], lot['currency'])}")
-                c4.write(f"Kalan: {lot['remaining_shares']:.2f}/{lot['initial_shares']:.2f} Lot")
+                
+                # Durum Rozeti
+                if rem == init_sh:
+                    status_badge = "🟢 Açık"
+                elif rem == 0:
+                    status_badge = "🔴 Kapatıldı (0 Lot)"
+                else:
+                    status_badge = f"🟡 Kısmi ({rem:.2f} Kaldı)"
+
+                c4.write(f"{status_badge} ({rem:.2f}/{init_sh:.2f})")
 
                 if c5.button("✏️ Düzenle", key=f"edit_btn_{lot['lot_id']}"):
                     st.session_state.edit_lot_id = int(lot["lot_id"])
                     st.rerun()
 
-                if lot["remaining_shares"] == lot["initial_shares"]:
+                # Sadece hiç satış yapılmamış lotlar doğrudan silinebilir (veri bütünlüğü koruması)
+                if rem == init_sh:
                     if c6.button("🗑️ Sil", key=f"del_lot_{lot['lot_id']}"):
                         with get_connection() as conn:
                             cursor = conn.cursor()
@@ -955,7 +998,7 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                         st.success("Alış silindi ve Telegram yedeği gönderildi.")
                         st.rerun()
                 else:
-                    c6.caption("Kısmi Satıldı")
+                    c6.caption("Satış Bağlı")
 
     with tab_sales:
         sales_df = load_sales()
