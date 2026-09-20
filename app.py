@@ -65,7 +65,6 @@ def init_db():
                         current_price REAL DEFAULT NULL,
                         allocations_json TEXT)''')
         
-        # Notlar ve İzleme Listesi Tablosu
         c.execute('''CREATE TABLE IF NOT EXISTS watchlist_notes (
                         ticker TEXT PRIMARY KEY,
                         note TEXT DEFAULT '',
@@ -104,18 +103,18 @@ def _send_telegram_thread(caption_text):
 def trigger_auto_backup(action_name="Yeni İşlem"):
     threading.Thread(target=_send_telegram_thread, args=(action_name,), daemon=True).start()
 
-# --- 3. CANLI DÖVİZ KURLARI, HİSSE FİYATLARI VE PERFORMANSLAR ---
-@st.cache_data(ttl=1800)
+# --- 3. DÖVİZ KURLARI, HİSSE FİYATLARI VE PERFORMANSLAR ---
+@st.cache_data(ttl=900)
 def fetch_live_fx_rates():
-    rates = {"USD_TRY": 48.78, "EUR_TRY": 53.20, "EUR_USD": 1.09}
+    rates = {"USD_TRY": 34.20, "EUR_TRY": 37.80, "EUR_USD": 1.10}
     try:
         url = "https://open.er-api.com/v6/latest/USD"
         res = requests.get(url, timeout=4).json()
         if res and "rates" in res:
-            usd_try = float(res["rates"].get("TRY", 48.78))
+            usd_try = float(res["rates"].get("TRY", 34.20))
             usd_eur = float(res["rates"].get("EUR", 0.91))
-            eur_usd = 1.0 / usd_eur if usd_eur else 1.09
-            eur_try = usd_try / usd_eur if usd_eur else 53.20
+            eur_usd = 1.0 / usd_eur if usd_eur else 1.10
+            eur_try = usd_try / usd_eur if usd_eur else 37.80
             rates = {
                 "USD_TRY": round(usd_try, 2),
                 "EUR_TRY": round(eur_try, 2),
@@ -127,15 +126,24 @@ def fetch_live_fx_rates():
 
 live_rates = fetch_live_fx_rates()
 
-@st.cache_data(ttl=300)
+@st.cache_data(ttl=120)
 def get_live_price(ticker_symbol: str) -> float:
     sym = ticker_symbol.strip().upper()
     try:
         t = yf.Ticker(sym)
+        # 1. Öncelik: fast_info
         if hasattr(t, "fast_info") and t.fast_info is not None:
             lp = t.fast_info.get("lastPrice") or t.fast_info.get("previousClose")
-            if lp and lp > 0:
+            if lp and float(lp) > 0:
                 return round(float(lp), 2)
+        # 2. Öncelik: info
+        try:
+            info_price = t.info.get("regularMarketPrice") or t.info.get("currentPrice")
+            if info_price and float(info_price) > 0:
+                return round(float(info_price), 2)
+        except Exception:
+            pass
+        # 3. Öncelik: history
         hist = t.history(period="5d")
         if not hist.empty and "Close" in hist:
             closes = hist["Close"].dropna()
@@ -157,9 +165,8 @@ def get_stock_sector(ticker_symbol: str) -> str:
         pass
     return "Genel"
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=300)
 def get_multi_period_performance(ticker_symbol: str):
-    """Günlük, Haftalık, Aylık, 6 Aylık, Yıllık ve 3 Yıllık getirileri hesaplar."""
     sym = ticker_symbol.strip().upper()
     perf = {"price": 0.0, "1D": 0.0, "1W": 0.0, "1M": 0.0, "6M": 0.0, "1Y": 0.0, "3Y": 0.0, "currency": "USD"}
     try:
@@ -310,10 +317,11 @@ with st.sidebar:
 
 # --- 6. DASHBOARD ---
 if menu == "📊 Dashboard":
-    c_btn, _ = st.columns([2, 5])
-    if c_btn.button("🔄 Canlı Fiyatları & Kurları Güncelle"):
-        st.cache_data.clear()
-        st.rerun()
+    c_btn1, c_btn2 = st.columns([3, 4])
+    with c_btn1:
+        if st.button("🔄 Canlı Piyasa Fiyatlarını Şimdi Güncelle", type="primary", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
 
     lots_df = load_open_lots()
     sales_df = load_sales()
@@ -549,8 +557,14 @@ if menu == "📊 Dashboard":
         else:
             st.info("Bu portföyde henüz açık hisse bulunmuyor.")
 
-# --- 7. YENİ MENÜ: İZLEME LİSTESİ & PERFORMANS ANALİZİ (NOT ALMA DAHİL) ---
+# --- 7. İZLEME LİSTESİ & PERFORMANS ANALİZİ ---
 elif menu == "📈 İzleme Listesi & Performans Analizi":
+    c_btn1, c_btn2 = st.columns([3, 4])
+    with c_btn1:
+        if st.button("🔄 İzleme Listesi Fiyatlarını Şimdi Güncelle", type="primary", use_container_width=True):
+            st.cache_data.clear()
+            st.rerun()
+
     st.title("📈 İzleme Listesi & Dönemsel Performans Tablosu")
     st.caption("Seçtiğiniz hisselerin 1G, 1H, 1A, 6A, 1Y ve 3Y getirilerini karşılaştırın ve kişisel notlarınızı tutun.")
 
@@ -578,7 +592,6 @@ elif menu == "📈 İzleme Listesi & Performans Analizi":
 
     st.divider()
 
-    # NOT DÜZENLEME PANELİ (AÇILIR-KAPANIR KUTU)
     if st.session_state.active_note_ticker:
         act_sym = st.session_state.active_note_ticker
         st.subheader(f"📝 {act_sym} İçin Not Düzenleme")
@@ -589,7 +602,7 @@ elif menu == "📈 İzleme Listesi & Performans Analizi":
             current_note = matched_note.iloc[0]["note"] or ""
 
         with st.form("note_form"):
-            note_content = st.text_area("Hisse Notunuz (Hedef fiyat, alım-satım tezi, bilanço beklentisi vb.):", value=current_note, height=120)
+            note_content = st.text_area("Hisse Notunuz (Hedef fiyat, alım-satım tezi vb.):", value=current_note, height=120)
             c_save, c_cancel = st.columns([1, 4])
             if c_save.form_submit_button("💾 Notu Kaydet", type="primary"):
                 save_note_db(act_sym, note_content)
@@ -606,12 +619,11 @@ elif menu == "📈 İzleme Listesi & Performans Analizi":
         st.info("Lütfen yukarıdaki menüden izlemek istediğiniz en az bir hisse seçin.")
     else:
         perf_data = []
-        with st.spinner("Piyasa verileri taranıyor..."):
+        with st.spinner("Piyasa verileri güncelleniyor..."):
             for sym in selected_tickers:
                 p_res = get_multi_period_performance(sym)
                 sec = get_stock_sector(sym)
                 
-                # Mevcut notu çek
                 note_str = "Not Yok"
                 n_match = notes_df[notes_df["ticker"] == sym]
                 if not n_match.empty and n_match.iloc[0]["note"]:
@@ -620,7 +632,7 @@ elif menu == "📈 İzleme Listesi & Performans Analizi":
                 perf_data.append({
                     "Hisse": sym,
                     "Sektör": sec,
-                    "Son Fiyat": format_curr(p_res["price"], p_res["currency"]),
+                    "Son Fiyat": format_curr(p_res["price"], p_res["currency"]) if p_res["price"] > 0 else "⚠️ Alınamadı",
                     "1 Gün (1G)": p_res["1D"],
                     "1 Hafta (1H)": p_res["1W"],
                     "1 Ay (1A)": p_res["1M"],
@@ -632,7 +644,6 @@ elif menu == "📈 İzleme Listesi & Performans Analizi":
 
         df_perf = pd.DataFrame(perf_data)
 
-        # TABLO TASARIMI
         def build_perf_html(df):
             html = """<table style="width:100%; border-collapse: collapse; text-align:left;">
             <thead>
@@ -1085,7 +1096,7 @@ elif menu == "💾 Yedekleme & Portföy Ayarları":
                         st.success(f"{p_row['name']} portföyü silindi.")
                         st.rerun()
 
-# --- 12. EXCEL RAPORU & İÇE AKTARMA (UPLOAD) ---
+# --- 12. EXCEL RAPORU & İÇE AKTARMA ---
 elif menu == "📥 Excel Raporu & İçe Aktarma":
     st.title("📥 Excel Raporu & İçe Aktarma (Senkronizasyon)")
     tab_exp, tab_imp = st.tabs(["📤 Excel İndir (Dışa Aktar)", "📥 Excel Yükle (İçe Aktar & Güncelle)"])
