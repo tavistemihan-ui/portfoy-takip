@@ -239,7 +239,7 @@ with st.sidebar:
             "🎯 Satış Sonrası Analiz",
             "✏️ Geçmiş İşlem Yönetimi & Düzeltme",
             "💾 Yedekleme & Portföy Ayarları",
-            "📥 Excel Raporu"
+            "📥 Excel Raporu & İçe Aktarma"
         ]
     )
 
@@ -484,7 +484,7 @@ if menu == "📊 Dashboard":
         else:
             st.info("Bu portföyde henüz açık hisse bulunmuyor.")
 
-# --- 7. YENİ İŞLEM / SATIŞ (TÜMÜ BUTONU & SATIŞ TARİHİ GİRİŞİ DAHİL) ---
+# --- 7. YENİ İŞLEM / SATIŞ ---
 elif menu == "📝 Yeni İşlem / Satış":
     st.title("📝 İşlem Girişi")
     port_dict = {f"{r['name']} ({r['currency']})": (r['id'], r['currency']) for _, r in portfolios_df.iterrows()}
@@ -565,7 +565,6 @@ elif menu == "📝 Yeni İşlem / Satış":
                 c2.write(f"Alış: **{format_curr(lot['buy_price'], lot['currency'])}**")
                 c3.write(f"Kalan: **{rem_shares:.2f} lot**")
                 
-                # Streamlit güvenli callback fonksiyonu ile "Tümü" butonu
                 with c5:
                     st.write("")
                     st.button(
@@ -888,23 +887,63 @@ elif menu == "💾 Yedekleme & Portföy Ayarları":
                         st.success(f"{p_row['name']} portföyü silindi.")
                         st.rerun()
 
-# --- 11. EXCEL RAPORU ---
-elif menu == "📥 Excel Raporu":
-    st.title("📥 Excel Raporu İndir")
-    with get_connection() as conn:
-        df_lots = pd.read_sql("SELECT * FROM lots", conn)
-        df_sales = pd.read_sql("SELECT * FROM sales", conn)
-    
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="openpyxl") as writer:
-        df_lots.to_excel(writer, sheet_name="Açık_Lotlar", index=False)
-        if not df_sales.empty:
-            df_sales.drop(columns=["allocations_json"], errors="ignore").to_excel(writer, sheet_name="Satış_Geçmişi", index=False)
-    output.seek(0)
+# --- 11. EXCEL RAPORU & İÇE AKTARMA (UPLOAD) ---
+elif menu == "📥 Excel Raporu & İçe Aktarma":
+    st.title("📥 Excel Raporu & İçe Aktarma (Senkronizasyon)")
+    tab_exp, tab_imp = st.tabs(["📤 Excel İndir (Dışa Aktar)", "📥 Excel Yükle (İçe Aktar & Güncelle)"])
 
-    st.download_button(
-        label="📊 Excel Dosyasını İndir (.xlsx)",
-        data=output,
-        file_name=f"Portfoy_{datetime.now().strftime('%Y%m%d')}.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+    with tab_exp:
+        st.subheader("Excel Olarak İndir")
+        st.caption("Açık lotlarınızı ve satış geçmişinizi içeren çift sekmeli Excel dosyası oluşturulur.")
+        
+        with get_connection() as conn:
+            df_lots = pd.read_sql("SELECT * FROM lots", conn)
+            df_sales = pd.read_sql("SELECT * FROM sales", conn)
+        
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            df_lots.to_excel(writer, sheet_name="Açık_Lotlar", index=False)
+            if not df_sales.empty:
+                df_sales.to_excel(writer, sheet_name="Satış_Geçmişi", index=False)
+            else:
+                pd.DataFrame(columns=["sale_id", "portfolio_id", "ticker", "sale_date", "shares", "sale_price", "cost", "commission", "realized_pnl", "currency", "current_price", "allocations_json"]).to_excel(writer, sheet_name="Satış_Geçmişi", index=False)
+        output.seek(0)
+
+        st.download_button(
+            label="📊 Excel Dosyasını İndir (.xlsx)",
+            data=output,
+            file_name=f"Portfoy_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
+    with tab_imp:
+        st.subheader("Excel ile Güncelle / Yükle")
+        st.info("💡 **Nasıl Kullanılır?** İndirdiğiniz Excel üzerinde değerleri (fiyat, adet, tarih vb.) düzenledikten sonra buraya yükleyin. Veritabanınız Excel'deki son haline göre güncellenir ve Telegram yedeği alınır.")
+
+        uploaded_excel = st.file_uploader("Düzenlenmiş Excel Dosyasını Seçin (.xlsx)", type=["xlsx"])
+        if uploaded_excel is not None:
+            try:
+                xls = pd.ExcelFile(uploaded_excel)
+                lots_preview = pd.read_excel(xls, "Açık_Lotlar") if "Açık_Lotlar" in xls.sheet_names else pd.DataFrame()
+                sales_preview = pd.read_excel(xls, "Satış_Geçmişi") if "Satış_Geçmişi" in xls.sheet_names else pd.DataFrame()
+
+                st.write(f"🔎 **Yüklenen Dosya:** {len(lots_preview)} adet alış kaydı, {len(sales_preview)} adet satış kaydı tespit edildi.")
+
+                if st.button("🚀 Excel'deki Verileri Sisteme Yükle ve Güncelle", type="primary"):
+                    with get_connection() as conn:
+                        cursor = conn.cursor()
+                        if not lots_preview.empty:
+                            cursor.execute("DELETE FROM lots")
+                            lots_preview.to_sql("lots", conn, if_exists="append", index=False)
+                        
+                        if not sales_preview.empty:
+                            cursor.execute("DELETE FROM sales")
+                            sales_preview.to_sql("sales", conn, if_exists="append", index=False)
+                        conn.commit()
+
+                    st.cache_data.clear()
+                    trigger_auto_backup("Excel Yüklemesi ile Toplu Güncelleme")
+                    st.success("✅ Verileriniz başarıyla Excel'den yüklendi ve güncel yedek Telegram'a iletildi!")
+                    st.rerun()
+            except Exception as e:
+                st.error(f"Excel okunurken bir hata oluştu: {e}")
