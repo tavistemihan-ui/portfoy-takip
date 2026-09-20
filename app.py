@@ -65,6 +65,12 @@ def init_db():
                         current_price REAL DEFAULT NULL,
                         allocations_json TEXT)''')
         
+        # Notlar ve İzleme Listesi Tablosu
+        c.execute('''CREATE TABLE IF NOT EXISTS watchlist_notes (
+                        ticker TEXT PRIMARY KEY,
+                        note TEXT DEFAULT '',
+                        updated_at TEXT)''')
+        
         c.execute("SELECT COUNT(*) FROM portfolios")
         if c.fetchone()[0] == 0:
             c.executemany("INSERT INTO portfolios (name, currency) VALUES (?, ?)", [
@@ -98,7 +104,7 @@ def _send_telegram_thread(caption_text):
 def trigger_auto_backup(action_name="Yeni İşlem"):
     threading.Thread(target=_send_telegram_thread, args=(action_name,), daemon=True).start()
 
-# --- 3. CANLI DÖVİZ KURLARI, HİSSE FİYATLARI VE SEKTÖRLER ---
+# --- 3. CANLI DÖVİZ KURLARI, HİSSE FİYATLARI VE PERFORMANSLAR ---
 @st.cache_data(ttl=1800)
 def fetch_live_fx_rates():
     rates = {"USD_TRY": 48.78, "EUR_TRY": 53.20, "EUR_USD": 1.09}
@@ -151,6 +157,49 @@ def get_stock_sector(ticker_symbol: str) -> str:
         pass
     return "Genel"
 
+@st.cache_data(ttl=600)
+def get_multi_period_performance(ticker_symbol: str):
+    """Günlük, Haftalık, Aylık, 6 Aylık, Yıllık ve 3 Yıllık getirileri hesaplar."""
+    sym = ticker_symbol.strip().upper()
+    perf = {"price": 0.0, "1D": 0.0, "1W": 0.0, "1M": 0.0, "6M": 0.0, "1Y": 0.0, "3Y": 0.0, "currency": "USD"}
+    try:
+        t = yf.Ticker(sym)
+        hist = t.history(period="3y")
+        if hist.empty or len(hist) < 2:
+            return perf
+        
+        closes = hist["Close"].dropna()
+        if closes.empty:
+            return perf
+
+        cur = float(closes.iloc[-1])
+        perf["price"] = round(cur, 2)
+        
+        try:
+            perf["currency"] = t.fast_info.get("currency", "USD") or "USD"
+        except Exception:
+            perf["currency"] = "USD"
+
+        def get_ret(days_back):
+            if len(closes) > days_back:
+                old = float(closes.iloc[-1 - days_back])
+                if old > 0:
+                    return round(((cur - old) / old) * 100, 2)
+            return 0.0
+
+        perf["1D"] = get_ret(1)
+        perf["1W"] = get_ret(5)
+        perf["1M"] = get_ret(21)
+        perf["6M"] = get_ret(126)
+        perf["1Y"] = get_ret(252)
+
+        first = float(closes.iloc[0])
+        if first > 0 and len(closes) >= 500:
+            perf["3Y"] = round(((cur - first) / first) * 100, 2)
+    except Exception:
+        pass
+    return perf
+
 def format_curr(amount: float, curr: str) -> str:
     if curr == "USD":
         return f"${amount:,.2f}"
@@ -197,12 +246,27 @@ def load_sales(portfolio_id=None):
             q += f" AND portfolio_id = {portfolio_id}"
         return pd.read_sql(q, conn)
 
+def load_all_notes():
+    with get_connection() as conn:
+        return pd.read_sql("SELECT * FROM watchlist_notes", conn)
+
+def save_note_db(ticker, note_text):
+    with get_connection() as conn:
+        c = conn.cursor()
+        c.execute('''INSERT INTO watchlist_notes (ticker, note, updated_at) 
+                     VALUES (?, ?, ?) 
+                     ON CONFLICT(ticker) DO UPDATE SET note=excluded.note, updated_at=excluded.updated_at''',
+                  (ticker.strip().upper(), note_text.strip(), datetime.now().strftime("%Y-%m-%d %H:%M")))
+        conn.commit()
+
 portfolios_df = load_portfolios()
 
 if "edit_lot_id" not in st.session_state:
     st.session_state.edit_lot_id = None
 if "edit_sale_id" not in st.session_state:
     st.session_state.edit_sale_id = None
+if "active_note_ticker" not in st.session_state:
+    st.session_state.active_note_ticker = None
 
 # --- 5. KENAR ÇUBUĞU ---
 with st.sidebar:
@@ -235,6 +299,7 @@ with st.sidebar:
         "Menü",
         [
             "📊 Dashboard",
+            "📈 İzleme Listesi & Performans Analizi",
             "📝 Yeni İşlem / Satış",
             "🎯 Satış Sonrası Analiz",
             "✏️ Geçmiş İşlem Yönetimi & Düzeltme",
@@ -484,7 +549,140 @@ if menu == "📊 Dashboard":
         else:
             st.info("Bu portföyde henüz açık hisse bulunmuyor.")
 
-# --- 7. YENİ İŞLEM / SATIŞ ---
+# --- 7. YENİ MENÜ: İZLEME LİSTESİ & PERFORMANS ANALİZİ (NOT ALMA DAHİL) ---
+elif menu == "📈 İzleme Listesi & Performans Analizi":
+    st.title("📈 İzleme Listesi & Dönemsel Performans Tablosu")
+    st.caption("Seçtiğiniz hisselerin 1G, 1H, 1A, 6A, 1Y ve 3Y getirilerini karşılaştırın ve kişisel notlarınızı tutun.")
+
+    lots_df = load_open_lots()
+    existing_tickers = sorted(list(lots_df["ticker"].unique())) if not lots_df.empty else []
+    
+    notes_df = load_all_notes()
+    saved_watched = list(notes_df["ticker"].unique()) if not notes_df.empty else []
+
+    all_candidate_tickers = sorted(list(set(existing_tickers + saved_watched + ["AAPL", "MSFT", "NVDA", "THYAO.IS", "BNS"])))
+
+    c_sel, c_add = st.columns([3, 1])
+    with c_sel:
+        selected_tickers = st.multiselect(
+            "İzlenecek ve Karşılaştırılacak Hisseleri Seçin:",
+            options=all_candidate_tickers,
+            default=existing_tickers if existing_tickers else (saved_watched[:3] if saved_watched else ["AAPL", "BNS"])
+        )
+    with c_add:
+        new_custom_ticker = st.text_input("Yeni Hisse Ekle (Ticker)", placeholder="Örn: GOOGL, EREGL.IS").strip().upper()
+        if st.button("Listeye Ekle"):
+            if new_custom_ticker and new_custom_ticker not in all_candidate_tickers:
+                save_note_db(new_custom_ticker, "")
+                st.rerun()
+
+    st.divider()
+
+    # NOT DÜZENLEME PANELİ (AÇILIR-KAPANIR KUTU)
+    if st.session_state.active_note_ticker:
+        act_sym = st.session_state.active_note_ticker
+        st.subheader(f"📝 {act_sym} İçin Not Düzenleme")
+        
+        current_note = ""
+        matched_note = notes_df[notes_df["ticker"] == act_sym]
+        if not matched_note.empty:
+            current_note = matched_note.iloc[0]["note"] or ""
+
+        with st.form("note_form"):
+            note_content = st.text_area("Hisse Notunuz (Hedef fiyat, alım-satım tezi, bilanço beklentisi vb.):", value=current_note, height=120)
+            c_save, c_cancel = st.columns([1, 4])
+            if c_save.form_submit_button("💾 Notu Kaydet", type="primary"):
+                save_note_db(act_sym, note_content)
+                st.session_state.active_note_ticker = None
+                trigger_auto_backup(f"Not Güncellendi: {act_sym}")
+                st.success(f"{act_sym} notu kaydedildi!")
+                st.rerun()
+            if c_cancel.form_submit_button("Kapat"):
+                st.session_state.active_note_ticker = None
+                st.rerun()
+        st.divider()
+
+    if not selected_tickers:
+        st.info("Lütfen yukarıdaki menüden izlemek istediğiniz en az bir hisse seçin.")
+    else:
+        perf_data = []
+        with st.spinner("Piyasa verileri taranıyor..."):
+            for sym in selected_tickers:
+                p_res = get_multi_period_performance(sym)
+                sec = get_stock_sector(sym)
+                
+                # Mevcut notu çek
+                note_str = "Not Yok"
+                n_match = notes_df[notes_df["ticker"] == sym]
+                if not n_match.empty and n_match.iloc[0]["note"]:
+                    note_str = n_match.iloc[0]["note"]
+
+                perf_data.append({
+                    "Hisse": sym,
+                    "Sektör": sec,
+                    "Son Fiyat": format_curr(p_res["price"], p_res["currency"]),
+                    "1 Gün (1G)": p_res["1D"],
+                    "1 Hafta (1H)": p_res["1W"],
+                    "1 Ay (1A)": p_res["1M"],
+                    "6 Ay (6A)": p_res["6M"],
+                    "1 Yıl (1Y)": p_res["1Y"],
+                    "3 Yıl (3Y)": p_res["3Y"],
+                    "Not": note_str
+                })
+
+        df_perf = pd.DataFrame(perf_data)
+
+        # TABLO TASARIMI
+        def build_perf_html(df):
+            html = """<table style="width:100%; border-collapse: collapse; text-align:left;">
+            <thead>
+                <tr style="border-bottom: 2px solid #30363d; background-color:#161b22;">
+                    <th style="padding:10px; color:#c9d1d9;">Hisse</th>
+                    <th style="padding:10px; color:#c9d1d9;">Sektör</th>
+                    <th style="padding:10px; color:#c9d1d9;">Son Fiyat</th>
+                    <th style="padding:10px; color:#c9d1d9;">1 Gün</th>
+                    <th style="padding:10px; color:#c9d1d9;">1 Hafta</th>
+                    <th style="padding:10px; color:#c9d1d9;">1 Ay</th>
+                    <th style="padding:10px; color:#c9d1d9;">6 Ay</th>
+                    <th style="padding:10px; color:#c9d1d9;">1 Yıl</th>
+                    <th style="padding:10px; color:#c9d1d9;">3 Yıl</th>
+                    <th style="padding:10px; color:#c9d1d9; width:25%;">Kayıtlı Not Özeti</th>
+                </tr>
+            </thead>
+            <tbody>"""
+
+            for _, row in df.iterrows():
+                html += "<tr style='border-bottom: 1px solid #21262d;'>"
+                html += f"<td style='padding:10px; font-weight:bold; color:#e6edf3;'>{row['Hisse']}</td>"
+                html += f"<td style='padding:10px; color:#58a6ff;'>{row['Sektör']}</td>"
+                html += f"<td style='padding:10px; font-weight:600; color:#e6edf3;'>{row['Son Fiyat']}</td>"
+
+                for period_col in ["1 Gün (1G)", "1 Hafta (1H)", "1 Ay (1A)", "6 Ay (6A)", "1 Yıl (1Y)", "3 Yıl (3Y)"]:
+                    val = row[period_col]
+                    col_color = "#2ea043" if val >= 0 else "#f85149"
+                    html += f"<td style='padding:10px; font-weight:bold; color:{col_color};'>%{val:+.2f}</td>"
+
+                note_preview = row["Not"]
+                if len(note_preview) > 50:
+                    note_preview = note_preview[:50] + "..."
+                html += f"<td style='padding:10px; color:#8b949e; font-size:13px;'>{note_preview}</td>"
+                html += "</tr>"
+
+            html += "</tbody></table>"
+            return html
+
+        st.write(build_perf_html(df_perf), unsafe_allow_html=True)
+        
+        st.divider()
+        st.subheader("📝 Hisse Notu Ekle & Düzenle")
+        c_cols = st.columns(len(selected_tickers) if len(selected_tickers) <= 5 else 5)
+        for i, sym in enumerate(selected_tickers):
+            with c_cols[i % 5]:
+                if st.button(f"✏️ {sym} Notu", key=f"btn_note_{sym}"):
+                    st.session_state.active_note_ticker = sym
+                    st.rerun()
+
+# --- 8. YENİ İŞLEM / SATIŞ ---
 elif menu == "📝 Yeni İşlem / Satış":
     st.title("📝 İşlem Girişi")
     port_dict = {f"{r['name']} ({r['currency']})": (r['id'], r['currency']) for _, r in portfolios_df.iterrows()}
@@ -621,7 +819,7 @@ elif menu == "📝 Yeni İşlem / Satış":
                     st.success("Satış tamamlandı ve yedeği Telegram'a gönderildi!")
                     st.rerun()
 
-# --- 8. SATIŞ SONRASI ANALİZ ---
+# --- 9. SATIŞ SONRASI ANALİZ ---
 elif menu == "🎯 Satış Sonrası Analiz":
     st.title("🎯 Satış Sonrası Karar & Fiyat Analizi")
     sales_df = load_sales()
@@ -675,7 +873,7 @@ elif menu == "🎯 Satış Sonrası Analiz":
 
                 st.divider()
 
-# --- 9. GEÇMİŞ İŞLEM YÖNETİMİ & DÜZELTME ---
+# --- 10. GEÇMİŞ İŞLEM YÖNETİMİ & DÜZELTME ---
 elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
     st.title("✏️ İşlem Düzeltme, Güncelleme ve Silme")
     tab_buys, tab_sales = st.tabs(["🟢 Alış Lotlarını Düzelt / Sil", "🔴 Satış Kayıtlarını Düzelt / Geri Al"])
@@ -812,7 +1010,7 @@ elif menu == "✏️ Geçmiş İşlem Yönetimi & Düzeltme":
                     st.success("Satış geri alındı ve Telegram yedeği gönderildi.")
                     st.rerun()
 
-# --- 10. YEDEKLEME & PORTFÖY AYARLARI ---
+# --- 11. YEDEKLEME & PORTFÖY AYARLARI ---
 elif menu == "💾 Yedekleme & Portföy Ayarları":
     st.title("💾 Yedekleme & Portföy Yönetimi")
 
@@ -887,18 +1085,19 @@ elif menu == "💾 Yedekleme & Portföy Ayarları":
                         st.success(f"{p_row['name']} portföyü silindi.")
                         st.rerun()
 
-# --- 11. EXCEL RAPORU & İÇE AKTARMA (UPLOAD) ---
+# --- 12. EXCEL RAPORU & İÇE AKTARMA (UPLOAD) ---
 elif menu == "📥 Excel Raporu & İçe Aktarma":
     st.title("📥 Excel Raporu & İçe Aktarma (Senkronizasyon)")
     tab_exp, tab_imp = st.tabs(["📤 Excel İndir (Dışa Aktar)", "📥 Excel Yükle (İçe Aktar & Güncelle)"])
 
     with tab_exp:
         st.subheader("Excel Olarak İndir")
-        st.caption("Açık lotlarınızı ve satış geçmişinizi içeren çift sekmeli Excel dosyası oluşturulur.")
+        st.caption("Açık lotlarınızı, satış geçmişinizi ve hisse notlarınızı içeren Excel dosyası oluşturulur.")
         
         with get_connection() as conn:
             df_lots = pd.read_sql("SELECT * FROM lots", conn)
             df_sales = pd.read_sql("SELECT * FROM sales", conn)
+            df_notes = pd.read_sql("SELECT * FROM watchlist_notes", conn)
         
         output = io.BytesIO()
         with pd.ExcelWriter(output, engine="openpyxl") as writer:
@@ -907,6 +1106,12 @@ elif menu == "📥 Excel Raporu & İçe Aktarma":
                 df_sales.to_excel(writer, sheet_name="Satış_Geçmişi", index=False)
             else:
                 pd.DataFrame(columns=["sale_id", "portfolio_id", "ticker", "sale_date", "shares", "sale_price", "cost", "commission", "realized_pnl", "currency", "current_price", "allocations_json"]).to_excel(writer, sheet_name="Satış_Geçmişi", index=False)
+            
+            if not df_notes.empty:
+                df_notes.to_excel(writer, sheet_name="Hisse_Notları", index=False)
+            else:
+                pd.DataFrame(columns=["ticker", "note", "updated_at"]).to_excel(writer, sheet_name="Hisse_Notları", index=False)
+
         output.seek(0)
 
         st.download_button(
@@ -918,7 +1123,7 @@ elif menu == "📥 Excel Raporu & İçe Aktarma":
 
     with tab_imp:
         st.subheader("Excel ile Güncelle / Yükle")
-        st.info("💡 **Nasıl Kullanılır?** İndirdiğiniz Excel üzerinde değerleri (fiyat, adet, tarih vb.) düzenledikten sonra buraya yükleyin. Veritabanınız Excel'deki son haline göre güncellenir ve Telegram yedeği alınır.")
+        st.info("💡 **Nasıl Kullanılır?** İndirdiğiniz Excel üzerinde değerleri düzenledikten sonra buraya yükleyin. Veritabanınız Excel'deki son haline göre güncellenir ve Telegram yedeği alınır.")
 
         uploaded_excel = st.file_uploader("Düzenlenmiş Excel Dosyasını Seçin (.xlsx)", type=["xlsx"])
         if uploaded_excel is not None:
@@ -926,8 +1131,9 @@ elif menu == "📥 Excel Raporu & İçe Aktarma":
                 xls = pd.ExcelFile(uploaded_excel)
                 lots_preview = pd.read_excel(xls, "Açık_Lotlar") if "Açık_Lotlar" in xls.sheet_names else pd.DataFrame()
                 sales_preview = pd.read_excel(xls, "Satış_Geçmişi") if "Satış_Geçmişi" in xls.sheet_names else pd.DataFrame()
+                notes_preview = pd.read_excel(xls, "Hisse_Notları") if "Hisse_Notları" in xls.sheet_names else pd.DataFrame()
 
-                st.write(f"🔎 **Yüklenen Dosya:** {len(lots_preview)} adet alış kaydı, {len(sales_preview)} adet satış kaydı tespit edildi.")
+                st.write(f"🔎 **Tespit Edilen Kayıtlar:** {len(lots_preview)} alış kaydı, {len(sales_preview)} satış kaydı, {len(notes_preview)} hisse notu.")
 
                 if st.button("🚀 Excel'deki Verileri Sisteme Yükle ve Güncelle", type="primary"):
                     with get_connection() as conn:
@@ -939,11 +1145,15 @@ elif menu == "📥 Excel Raporu & İçe Aktarma":
                         if not sales_preview.empty:
                             cursor.execute("DELETE FROM sales")
                             sales_preview.to_sql("sales", conn, if_exists="append", index=False)
+
+                        if not notes_preview.empty:
+                            cursor.execute("DELETE FROM watchlist_notes")
+                            notes_preview.to_sql("watchlist_notes", conn, if_exists="append", index=False)
                         conn.commit()
 
                     st.cache_data.clear()
                     trigger_auto_backup("Excel Yüklemesi ile Toplu Güncelleme")
-                    st.success("✅ Verileriniz başarıyla Excel'den yüklendi ve güncel yedek Telegram'a iletildi!")
+                    st.success("✅ Verileriniz ve notlarınız başarıyla Excel'den yüklendi!")
                     st.rerun()
             except Exception as e:
                 st.error(f"Excel okunurken bir hata oluştu: {e}")
